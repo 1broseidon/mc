@@ -34,6 +34,27 @@ layout): use `find_color` for distinctive UI elements (orange "=" button
 in gnome-calculator, colored project dots in Familiar's left rail,
 status indicators in dev tools).
 
+Recovery — WM bounds vs rendered surface: immediate-mode toolkits often
+don't react to `ConfigureNotify`, so a `window-maximize` / `window-resize`
+"succeeds" while the rendered canvas stays at the previous size. The
+WM-reported `client_bounds` then contains exposed desktop instead of
+app content, and coordinate-based clicks at those bounds miss.
+MyComputer detects this with `WINDOW_GEOMETRY_DIVERGED`:
+
+- After any `window-move` / `window-resize` / `window-maximize`, check
+  `details.warning.code` (or `result.warning.code` on the verb shape)
+  for `WINDOW_GEOMETRY_DIVERGED`. The `details.rendered_bounds_estimate`
+  field carries an approximate inner rectangle where rendered content
+  stops.
+- When the warning fires, abandon WM-coordinate targeting and switch
+  to `find_color` / `find_text` against a fresh screenshot of
+  `client_bounds`. Those find results return absolute screen
+  coordinates that match the rendered surface, not the WM frame.
+- `mycomputer windows --detect-rendered --json` adds an opt-in
+  `rendered_bounds_estimate` field per window so the agent can spot the
+  divergence without first running a window verb. The extra XGetImage
+  per window is off by default — only enable when sampling is needed.
+
 ```jsonc
 {
   "schema_version": "0.2",
@@ -49,6 +70,53 @@ status indicators in dev tools).
   ]
 }
 ```
+
+#### `find_text` → `find_color` recovery
+
+Codex's v0.3 dogfood found that even with auto-invert preprocessing,
+OCR can miss button glyphs in immediate-mode UIs. v0.3.1 auto-retries
+with `psm=11` (sparse text) on tight regions (< 100,000 px²) — but
+when both passes strike out, switch targeting modes entirely.
+
+Pattern:
+
+1. `find_text` for the label first — cheap when it works, and the
+   auto-retry already covers the easy recovery wins.
+2. On zero candidates (or low confidence), `find_color` on a hex that
+   uniquely identifies the surrounding control.
+3. `click` the located region.
+
+```jsonc
+// Goal: press gnome-calculator's "=" button. Try the OCR'd label first;
+// fall back to the orange button fill if OCR misses.
+{
+  "schema_version": "0.2",
+  "actions": [
+    {"type": "find_text", "query": "=",
+     "region": {"x":0,"y":400,"width":410,"height":100},
+     "min_confidence": 0.6, "as": "equals_text"},
+    // Always provide the find_color slot too — the click step uses
+    // whichever slot resolved (equals_text on OCR hit, equals_button
+    // when OCR misses and the smart-PSM retry still came back empty).
+    {"type": "find_color", "color": "#ff7800",
+     "region": {"x":0,"y":400,"width":410,"height":100},
+     "tolerance": 30, "as": "equals_button"},
+    {"type": "click", "target_slot": "equals_button"}
+  ]
+}
+```
+
+Other ready-made color targets for this pattern:
+
+- gnome-calculator `=` button — `#ff7800` (orange accent).
+- Familiar project dots — `#a78bfa` (purple), `#34d399` (green).
+- VS Code activity-bar badge — `#0078d4` (focus blue).
+- GNOME Terminal cursor — terminal foreground at known cell coordinates.
+
+A returned OCR candidate carrying `extra.psm_retried=true` /
+`extra.psm_used=11` is a strong signal that the region is borderline
+for OCR; make `find_color` the default for this UI going forward
+rather than relying on the retry to keep saving the call.
 
 ## Native GTK/Qt app QA
 

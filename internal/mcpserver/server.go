@@ -259,11 +259,11 @@ func New(opts Options) *mcp.Server {
 		res, err := pipeline.RunClickImage(ctx, in.toAction())
 		return nil, res, err
 	})
-	add(s, "window_move", "Move a window to (x, y) screen coordinates via EWMH _NET_MOVERESIZE_WINDOW. On tiling WMs the request may be refused; the result then carries a WINDOW_GEOMETRY_REFUSED warning under details.warning.", false, true, func(ctx context.Context, _ *mcp.CallToolRequest, in window.MoveRequest) (*mcp.CallToolResult, contract.ActionResult, error) {
+	add(s, "window_move", "Move a window to (x, y) screen coordinates via EWMH _NET_MOVERESIZE_WINDOW. On tiling WMs the request may be refused; the result then carries a WINDOW_GEOMETRY_REFUSED warning under details.warning. Immediate-mode toolkits (Gio, ImGui, Flutter-Linux, egui) may report success but leave the rendered surface stale; in that case details.warning.code is WINDOW_GEOMETRY_DIVERGED with a rendered_bounds_estimate — fall back to find_color/find_text.", false, true, func(ctx context.Context, _ *mcp.CallToolRequest, in window.MoveRequest) (*mcp.CallToolResult, contract.ActionResult, error) {
 		res, err := window.Move(ctx, in)
 		return nil, windowMCPResult("window_move", res, err), err
 	})
-	add(s, "window_resize", "Resize a window to width x height via EWMH _NET_MOVERESIZE_WINDOW. May be refused by tiling WMs; check details.warning.", false, true, func(ctx context.Context, _ *mcp.CallToolRequest, in window.ResizeRequest) (*mcp.CallToolResult, contract.ActionResult, error) {
+	add(s, "window_resize", "Resize a window to width x height via EWMH _NET_MOVERESIZE_WINDOW. May be refused by tiling WMs (WINDOW_GEOMETRY_REFUSED) or accepted by the WM while the rendered surface stays stale on immediate-mode toolkits (WINDOW_GEOMETRY_DIVERGED with rendered_bounds_estimate). Check details.warning.", false, true, func(ctx context.Context, _ *mcp.CallToolRequest, in window.ResizeRequest) (*mcp.CallToolResult, contract.ActionResult, error) {
 		res, err := window.Resize(ctx, in)
 		return nil, windowMCPResult("window_resize", res, err), err
 	})
@@ -275,7 +275,7 @@ func New(opts Options) *mcp.Server {
 		res, err := window.Minimize(ctx, in)
 		return nil, windowMCPResult("window_minimize", res, err), err
 	})
-	add(s, "window_maximize", "Toggle the maximized state of a window via _NET_WM_STATE. axis may be both (default), horz, or vert.", false, true, func(ctx context.Context, _ *mcp.CallToolRequest, in window.MaximizeRequest) (*mcp.CallToolResult, contract.ActionResult, error) {
+	add(s, "window_maximize", "Toggle the maximized state of a window via _NET_WM_STATE. axis may be both (default), horz, or vert. Immediate-mode toolkits may emit WINDOW_GEOMETRY_DIVERGED under details.warning when the rendered surface does not follow the WM resize; fall back to find_color/find_text targeting.", false, true, func(ctx context.Context, _ *mcp.CallToolRequest, in window.MaximizeRequest) (*mcp.CallToolResult, contract.ActionResult, error) {
 		res, err := window.Maximize(ctx, in)
 		return nil, windowMCPResult("window_maximize", res, err), err
 	})

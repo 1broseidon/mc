@@ -272,8 +272,13 @@ func Maximize(ctx context.Context, req MaximizeRequest) (VerbResult, error) {
 	event := xproto.ClientMessageEvent{Format: 32, Window: xid, Type: atoms["_NET_WM_STATE"], Data: data}
 	xproto.SendEvent(d.Conn, false, d.Screen.Root, xproto.EventMaskSubstructureRedirect|xproto.EventMaskSubstructureNotify, string(event.Bytes()))
 	d.Conn.Sync()
+	// Short settle so the WM has a chance to re-publish bounds before
+	// the surface-divergence sampler reads them back. Mirrors the same
+	// 30ms window used by runMoveResize.
+	time.Sleep(30 * time.Millisecond)
 	updated, _ := refreshInfo(d.Conn, d.Screen.Root, xid, atoms)
-	return VerbResult{Window: updated}, nil
+	warning := detectGeometryDivergence(d, updated)
+	return VerbResult{Window: updated, Warning: warning}, nil
 }
 
 // Workspace moves the window to the desktop at the given zero-based
@@ -401,6 +406,12 @@ func runMoveResize(ctx context.Context, target Target, x, y *int, w, h *int, act
 			Message: "window manager refused or partially applied the requested geometry",
 			Details: mismatch,
 		}
+	} else if div := detectGeometryDivergence(d, updated); div != nil {
+		// Only check for surface divergence when the WM actually applied
+		// the request. WM_GEOMETRY_REFUSED is the stronger signal and
+		// already tells the agent the same recovery (stop trusting WM
+		// coordinates), so we don't double-warn.
+		warning = div
 	}
 	_ = ctx
 	_ = action

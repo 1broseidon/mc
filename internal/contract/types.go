@@ -87,6 +87,21 @@ const (
 // The action result remains ok:true; the agent decides recovery.
 const WindowGeometryRefusedCode = "WINDOW_GEOMETRY_REFUSED"
 
+// WindowGeometryDivergedCode is emitted as a warning (not error) in
+// ActionResult.Details when a window verb's post-op WM-reported
+// client_bounds disagrees with the actually-rendered surface — typical
+// of immediate-mode toolkits (Gio, Dear ImGui, Flutter-Linux, egui)
+// that do not react to ConfigureNotify, leaving the WM-reported bounds
+// containing exposed desktop wallpaper instead of app content.
+//
+// Detection samples a 50x50 patch at the bottom-right interior corner
+// of client_bounds and compares it to the root window's dominant
+// background color; >=70% root-color hits flips the warning. The
+// action remains ok:true. Joins the WINDOW_GEOMETRY_REFUSED family of
+// advisory warnings; the agent should fall back to find_color /
+// find_text targeting instead of trusting WM coordinates.
+const WindowGeometryDivergedCode = "WINDOW_GEOMETRY_DIVERGED"
+
 // CoordSpace is a typed string alias for the coordinate-space enum.
 // Stored as plain string in Point.Space for JSON round-tripping; this
 // type is for internal type-safety where it matters.
