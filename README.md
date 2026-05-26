@@ -17,10 +17,25 @@ Use it when you need:
 
 ## Install
 
-Homebrew (Linux):
+One-line install (downloads the latest release into `~/.local/bin`):
 
 ```sh
-brew install 1broseidon/tap/mc
+curl -fsSL https://raw.githubusercontent.com/1broseidon/mc/main/install.sh | sh
+```
+
+Inspect first, then run:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/1broseidon/mc/main/install.sh -o install.sh
+less install.sh
+sh install.sh
+```
+
+Environment overrides:
+
+```sh
+VERSION=v0.3.0 sh install.sh                     # pin a specific tag
+BIN_DIR=/usr/local/bin sudo sh install.sh        # system-wide install
 ```
 
 Or with Go:
