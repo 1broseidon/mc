@@ -155,6 +155,25 @@ type FindTextRequest struct {
 // on the wire to keep the contract surface minimal.
 const darkThemeLuminanceThreshold = 80.0 / 255.0
 
+// smartPSMRegionThresholdPx is the upper area limit (in pixels) below
+// which find_text will auto-retry with psm=11 (sparse text) when the
+// default-PSM pass returns zero candidates. Below this size, the region
+// is likely a button label or sparse label, where psm=11 produces better
+// results than the default page-segmentation. Larger regions are likely
+// paragraph layouts where the default PSM is already optimal, so we
+// don't pay the extra Tesseract invocation. The auto-retry only fires
+// when the caller did not pass an explicit psm — explicit psm preserves
+// bit-for-bit existing behavior.
+const smartPSMRegionThresholdPx = 100_000
+
+// smartRetryPSM is the PSM value used for the sparse-text auto-retry
+// when the default pass returns zero candidates on a tight region.
+// PSM 11 is Tesseract's "sparse text — find as much text as possible
+// in no particular order" mode, which dramatically outperforms the
+// default page-segmentation on button labels, icon captions, and other
+// non-paragraph UI text.
+const smartRetryPSM = 11
+
 // FindText runs Tesseract over the requested region and returns
 // candidates whose recognized text matches the query. Sort order:
 // confidence desc, then top-to-bottom, left-to-right.
@@ -188,7 +207,14 @@ func FindText(ctx context.Context, batch *BatchContext, region contract.Bounds, 
 	}
 	prepped, applied := preprocessImage(img, mode)
 
-	words, err := runOCR(ctx, batch, region, prepped, lang, applied, req.PSM, req.OEM)
+	// psmUsed tracks the PSM value applied to the OCR call that
+	// produced the returned words. It starts at req.PSM (0 == Tesseract
+	// default) and is bumped to smartRetryPSM by the auto-retry path
+	// below. psmRetried records whether that retry fired so we can
+	// surface it in each candidate's extra.
+	psmUsed := req.PSM
+	psmRetried := false
+	words, err := runOCR(ctx, batch, region, prepped, lang, applied, psmUsed, req.OEM)
 	if err != nil {
 		return contract.FindResult{}, err
 	}
@@ -233,47 +259,78 @@ func FindText(ctx context.Context, batch *BatchContext, region contract.Bounds, 
 	multiwordMode := strings.ContainsAny(req.Query, " \t\n") ||
 		(req.Regex && strings.Contains(req.Query, `\s`))
 
-	matchUnits := tokenMatchUnits(words)
-	if multiwordMode {
-		matchUnits = append(matchUnits, phraseMatchUnits(words, maxPhraseTokens)...)
+	buildUnits := func(ws []ocrWord) []matchUnit {
+		units := tokenMatchUnits(ws)
+		if multiwordMode {
+			units = append(units, phraseMatchUnits(ws, maxPhraseTokens)...)
+		}
+		return units
 	}
 
-	var cands []contract.FindCandidate
-	for _, u := range matchUnits {
-		if strings.TrimSpace(u.text) == "" {
-			continue
+	buildCandidates := func(units []matchUnit) []contract.FindCandidate {
+		var out []contract.FindCandidate
+		for _, u := range units {
+			if strings.TrimSpace(u.text) == "" {
+				continue
+			}
+			if u.confidence < minConf {
+				continue
+			}
+			if !matcher(u.text) {
+				continue
+			}
+			extra := map[string]any{
+				"text":       u.text,
+				"lang":       lang,
+				"preprocess": applied,
+			}
+			if u.tokenCount > 1 {
+				extra["tokens"] = u.tokenCount
+			}
+			if psmUsed != 0 {
+				extra["psm"] = psmUsed
+			}
+			if req.OEM != 0 {
+				extra["oem"] = req.OEM
+			}
+			if psmRetried {
+				extra["psm_retried"] = true
+				extra["psm_used"] = psmUsed
+			}
+			out = append(out, contract.FindCandidate{
+				Bounds: contract.Bounds{
+					X:      region.X + u.left,
+					Y:      region.Y + u.top,
+					Width:  u.width,
+					Height: u.height,
+				},
+				Confidence: u.confidence,
+				Source:     contract.FindSourceOCR,
+				Extra:      extra,
+			})
 		}
-		if u.confidence < minConf {
-			continue
+		return out
+	}
+
+	cands := buildCandidates(buildUnits(words))
+
+	// Smart-PSM auto-retry. Gate: caller passed default psm (req.PSM == 0)
+	// AND first invocation produced zero matching candidates AND the
+	// search region is small enough to plausibly be a button label
+	// (area < smartPSMRegionThresholdPx). On gate match, retry the OCR
+	// call with psm=11 (sparse text). If the retry yields candidates,
+	// each surfaces psm_retried=true and psm_used=11 in extra. If the
+	// retry still produces zero, we fall through to the canonical
+	// TARGET_NOT_FOUND path unchanged. Explicit psm disables the retry
+	// entirely so existing-caller output stays bit-for-bit identical.
+	regionArea := region.Width * region.Height
+	if len(cands) == 0 && req.PSM == 0 && regionArea > 0 && regionArea < smartPSMRegionThresholdPx {
+		retryWords, retryErr := runOCR(ctx, batch, region, prepped, lang, applied, smartRetryPSM, req.OEM)
+		if retryErr == nil {
+			psmUsed = smartRetryPSM
+			psmRetried = true
+			cands = buildCandidates(buildUnits(retryWords))
 		}
-		if !matcher(u.text) {
-			continue
-		}
-		extra := map[string]any{
-			"text":       u.text,
-			"lang":       lang,
-			"preprocess": applied,
-		}
-		if u.tokenCount > 1 {
-			extra["tokens"] = u.tokenCount
-		}
-		if req.PSM != 0 {
-			extra["psm"] = req.PSM
-		}
-		if req.OEM != 0 {
-			extra["oem"] = req.OEM
-		}
-		cands = append(cands, contract.FindCandidate{
-			Bounds: contract.Bounds{
-				X:      region.X + u.left,
-				Y:      region.Y + u.top,
-				Width:  u.width,
-				Height: u.height,
-			},
-			Confidence: u.confidence,
-			Source:     contract.FindSourceOCR,
-			Extra:      extra,
-		})
 	}
 	sortCandidates(cands)
 	return contract.FindResult{

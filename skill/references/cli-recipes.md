@@ -448,10 +448,7 @@ when the task needs the user's actual visible browser window.
   press `escape` to dismiss hints, retry. If non-ASCII content,
   `via:auto` should have routed through paste — verify with
   `--dry-run`.
-- `find_text` returns zero candidates → try
-  `--preprocess invert`, then `--psm 6` (uniform block) or `--psm 11`
-  (sparse). Confirm Tesseract sees something with
-  `tesseract /tmp/region.png - --psm 6`.
+- `find_text` returns zero candidates → see "When OCR fails" below.
 - An app exposes no useful AT-SPI nodes → it's Gio/ImGui/Flutter/raylib.
   Use `find_text` / `find_image` / `find_color` exclusively.
 - `doctor` reports `xdg_session_type: wayland` and `x11` blocker → stop;
@@ -461,3 +458,53 @@ when the task needs the user's actual visible browser window.
   observed at timeout.
 - `WINDOW_GEOMETRY_REFUSED` warning → tiling WM. Either accept the
   WM-driven layout or use keyboard chords to invoke WM verbs.
+
+### When OCR fails
+
+Escalation order when `find_text` returns zero candidates. Each step
+is roughly 10× more reliable than the previous on hostile UIs (dark
+themes, anti-aliased fonts, immediate-mode renderers); stop at the
+first one that hits.
+
+1. **`--psm 11` (sparse text).** Tesseract's default page-segmentation
+   assumes paragraph layout, which collapses on single-word labels.
+   v0.3.1 auto-retries with psm=11 on tight regions (< 100,000 px²) by
+   default, so most button labels recover for free — the candidate's
+   `extra.psm_retried=true` and `extra.psm_used=11` tell you it fired.
+   For larger regions, pass `--psm 11` explicitly:
+   ```bash
+   mycomputer find-text --psm 11 --region 0,300,400,250 '7'
+   ```
+
+2. **`--preprocess binarize` (Otsu).** Pushes the region to pure
+   black/white before OCR. Helps on low-contrast or gradient
+   backgrounds where invert alone isn't enough:
+   ```bash
+   mycomputer find-text --preprocess binarize --region 0,0,800,200 'Save'
+   ```
+
+3. **`find-color` on a distinctive hex.** When OCR is hopeless
+   (custom-drawn glyphs in Gio / Flutter / Dear ImGui), target a
+   uniquely-colored element instead: an accent button background, a
+   status dot, a focus ring. See `desktop-workflows.md` → "Drive a Gio
+   app" for the worked example.
+   ```bash
+   # gnome-calculator's orange "=" button:
+   mycomputer find-color --region 0,400,410,100 --tolerance 30 --json '#ff7800'
+   # Familiar's purple project dot:
+   mycomputer find-color --region 1030,201,40,400 --tolerance 30 --json '#a78bfa'
+   ```
+
+4. **`find-image` with a cropped template.** Last resort — capture
+   the target once, crop the unique glyph, and template-match. Brittle
+   under theme/zoom changes but works when nothing else does:
+   ```bash
+   mycomputer capture --region 0,0,1920,1080 --out /tmp/full.png
+   # crop the target glyph manually → /tmp/btn.png
+   mycomputer find-image --region 0,0,1920,1080 --template /tmp/btn.png --threshold 0.9 --json
+   ```
+
+Confirm Tesseract sees something at all with a direct call:
+```bash
+tesseract /tmp/region.png - --psm 11
+```

@@ -421,6 +421,131 @@ func TestFindText_MultiWordPhrase(t *testing.T) {
 	}
 }
 
+// TestFindText_SmartPSMRetry exercises the v0.3.1 auto-retry path
+// (task-30). Strategy: seed the batch OCR cache so runOCR returns
+// synthetic ocrWords without invoking tesseract. We pin two cache
+// entries against the same prepped image — psm=0 returns no words,
+// psm=11 returns the target token — and assert FindText surfaces
+// psm_retried=true / psm_used=11 on the resulting candidate.
+//
+// Why bypass tesseract: real Tesseract output for a given fixture is
+// not stable enough across tesseract versions to guarantee
+// "default PSM misses, psm=11 hits"; the cache-seed approach pins the
+// exact behavior the retry path must handle.
+func TestFindText_SmartPSMRetry(t *testing.T) {
+	if !tesseractAvailable() {
+		// runOCR still LookPath()s tesseract before consulting cache.
+		t.Skip("tesseract not on PATH")
+	}
+	// Small region (200*60 = 12_000 px², well below the 100_000 px²
+	// gate). Pixels are all white so preprocessImage("auto") returns
+	// applied="none" and `prepped` is the same buffer — making the
+	// cache hash deterministic from the input image alone.
+	region := contract.Bounds{X: 50, Y: 100, Width: 200, Height: 60}
+	img := image.NewRGBA(image.Rect(0, 0, 200, 60))
+	for y := 0; y < 60; y++ {
+		for x := 0; x < 200; x++ {
+			img.SetRGBA(x, y, color.RGBA{255, 255, 255, 255})
+		}
+	}
+	bctx := NewBatchContext()
+	hash := hashImage(region, img)
+	// psm=0 → no words (forces the gate to fire).
+	bctx.ocr["eng|none|"+hash+"|psm=0|oem=0"] = ocrEntry{words: nil}
+	// psm=11 → one synthetic word matching the query "OK".
+	bctx.ocr["eng|none|"+hash+"|psm=11|oem=0"] = ocrEntry{words: []ocrWord{
+		{text: "OK", left: 20, top: 10, width: 40, height: 30, confidence: 0.92, block: 1, par: 1, line: 1},
+	}}
+
+	res, err := FindText(context.Background(), bctx, region, img, FindTextRequest{Query: "OK"})
+	if err != nil {
+		t.Fatalf("FindText error: %v", err)
+	}
+	if len(res.Candidates) != 1 {
+		t.Fatalf("got %d candidates, want 1 (auto-retry should surface psm=11 result)", len(res.Candidates))
+	}
+	got := res.Candidates[0]
+	if retried, _ := got.Extra["psm_retried"].(bool); !retried {
+		t.Errorf("psm_retried = %v, want true (extra=%v)", got.Extra["psm_retried"], got.Extra)
+	}
+	if used, _ := got.Extra["psm_used"].(int); used != 11 {
+		t.Errorf("psm_used = %v, want 11 (extra=%v)", got.Extra["psm_used"], got.Extra)
+	}
+	// Bounds must be region-relative-shifted into screen space.
+	if got.Bounds.X != region.X+20 || got.Bounds.Y != region.Y+10 {
+		t.Errorf("bounds = %+v, want region+local offset (X=%d, Y=%d)", got.Bounds, region.X+20, region.Y+10)
+	}
+}
+
+// TestFindText_SmartPSMRetry_GateNegatives covers the cases where the
+// auto-retry MUST NOT fire: explicit psm, and large region. We assert
+// the retry didn't happen by checking that no second cache entry was
+// touched and that no psm_retried marker appears on any candidate.
+func TestFindText_SmartPSMRetry_GateNegatives(t *testing.T) {
+	if !tesseractAvailable() {
+		t.Skip("tesseract not on PATH")
+	}
+
+	// Case A: caller passes explicit psm — retry disabled by contract.
+	t.Run("explicit_psm_disables_retry", func(t *testing.T) {
+		region := contract.Bounds{X: 0, Y: 0, Width: 200, Height: 60}
+		img := image.NewRGBA(image.Rect(0, 0, 200, 60))
+		for y := 0; y < 60; y++ {
+			for x := 0; x < 200; x++ {
+				img.SetRGBA(x, y, color.RGBA{255, 255, 255, 255})
+			}
+		}
+		bctx := NewBatchContext()
+		hash := hashImage(region, img)
+		// Caller asked for psm=6 explicitly. Seed only that cache key
+		// with no words. Seeing the retry would require a psm=11 entry
+		// which is intentionally absent — if the retry fires it would
+		// shell out to tesseract (and the result would still be empty
+		// on this blank fixture, but we'd see OCRCalls increment).
+		bctx.ocr["eng|none|"+hash+"|psm=6|oem=0"] = ocrEntry{words: nil}
+		callsBefore := bctx.OCRCalls()
+		res, err := FindText(context.Background(), bctx, region, img, FindTextRequest{Query: "OK", PSM: 6})
+		if err != nil {
+			t.Fatalf("FindText error: %v", err)
+		}
+		if len(res.Candidates) != 0 {
+			t.Errorf("expected 0 candidates on blank fixture, got %d", len(res.Candidates))
+		}
+		// No tesseract invocation should have happened (cache hit on
+		// the psm=6 entry, no retry).
+		if got := bctx.OCRCalls() - callsBefore; got != 0 {
+			t.Errorf("OCRCalls delta = %d, want 0 (explicit psm must not trigger retry)", got)
+		}
+	})
+
+	// Case B: large region — area >= smartPSMRegionThresholdPx, so
+	// retry is gated off even when the first pass returns nothing.
+	t.Run("large_region_disables_retry", func(t *testing.T) {
+		// 400x300 = 120_000 px² > 100_000 threshold.
+		region := contract.Bounds{X: 0, Y: 0, Width: 400, Height: 300}
+		img := image.NewRGBA(image.Rect(0, 0, 400, 300))
+		for y := 0; y < 300; y++ {
+			for x := 0; x < 400; x++ {
+				img.SetRGBA(x, y, color.RGBA{255, 255, 255, 255})
+			}
+		}
+		bctx := NewBatchContext()
+		hash := hashImage(region, img)
+		bctx.ocr["eng|none|"+hash+"|psm=0|oem=0"] = ocrEntry{words: nil}
+		callsBefore := bctx.OCRCalls()
+		res, err := FindText(context.Background(), bctx, region, img, FindTextRequest{Query: "OK"})
+		if err != nil {
+			t.Fatalf("FindText error: %v", err)
+		}
+		if len(res.Candidates) != 0 {
+			t.Errorf("expected 0 candidates on blank large fixture, got %d", len(res.Candidates))
+		}
+		if got := bctx.OCRCalls() - callsBefore; got != 0 {
+			t.Errorf("OCRCalls delta = %d, want 0 (large region must not trigger retry)", got)
+		}
+	})
+}
+
 func TestFindImage_FindsTemplate(t *testing.T) {
 	haystack := loadFixturePNG(t, "hello_world.png")
 	region := contract.Bounds{X: 0, Y: 0, Width: haystack.Bounds().Dx(), Height: haystack.Bounds().Dy()}
