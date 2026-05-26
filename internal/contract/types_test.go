@@ -1,0 +1,453 @@
+package contract
+
+import (
+	"encoding/json"
+	"errors"
+	"strings"
+	"testing"
+)
+
+// jsonUnmarshal is a thin wrapper used by RegionRef tests to keep the
+// test bodies focused on assertions, not boilerplate.
+func jsonUnmarshal(s string, v any) error {
+	return json.Unmarshal([]byte(s), v)
+}
+
+func TestCoordMapRoundTripAndMap(t *testing.T) {
+	capture := Bounds{X: 10, Y: 20, Width: 1000, Height: 500}
+	image := Size{Width: 500, Height: 250}
+	m := NewCoordMap(capture, image)
+	if got, want := m.String(), "10,20,1000,500,500,250"; got != want {
+		t.Fatalf("coord map string = %q, want %q", got, want)
+	}
+	parsed, err := ParseCoordMap(m.String())
+	if err != nil {
+		t.Fatalf("ParseCoordMap returned error: %v", err)
+	}
+	x, y, err := parsed.MapPoint(250, 125)
+	if err != nil {
+		t.Fatalf("MapPoint returned error: %v", err)
+	}
+	if x != 510 || y != 270 {
+		t.Fatalf("mapped point = %d,%d, want 510,270", x, y)
+	}
+}
+
+func TestCoordMapRejectsBadInput(t *testing.T) {
+	if _, err := ParseCoordMap("1,2,3"); err == nil {
+		t.Fatal("expected invalid coord map error")
+	}
+	m := CoordMap{CaptureWidth: 100, CaptureHeight: 100, ImageWidth: 10, ImageHeight: 10}
+	if _, _, err := m.MapPoint(10, 0); err == nil {
+		t.Fatal("expected out-of-bounds point error")
+	}
+}
+
+func TestErrorCode(t *testing.T) {
+	if got := ErrorCode(Validation("BAD", "bad input", nil)); got != ExitValidation {
+		t.Fatalf("ErrorCode validation = %d, want %d", got, ExitValidation)
+	}
+}
+
+func TestSchemaVersionConstants(t *testing.T) {
+	if SchemaVersion == "" {
+		t.Fatal("SchemaVersion must be a non-empty constant")
+	}
+	versions := SupportedSchemaVersions()
+	if len(versions) == 0 {
+		t.Fatal("SupportedSchemaVersions must return at least one version")
+	}
+	found := false
+	for _, v := range versions {
+		if v == SchemaVersion {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("SchemaVersion %q must appear in SupportedSchemaVersions %v", SchemaVersion, versions)
+	}
+}
+
+func TestValidateSchemaVersion(t *testing.T) {
+	t.Run("empty rejected with REQUIRED code", func(t *testing.T) {
+		err := ValidateSchemaVersion("")
+		if err == nil {
+			t.Fatal("expected error for empty schema_version")
+		}
+		var app *AppError
+		if !errors.As(err, &app) {
+			t.Fatalf("expected AppError, got %T", err)
+		}
+		if app.Code != "VALIDATION_SCHEMA_VERSION_REQUIRED" {
+			t.Fatalf("code = %q, want VALIDATION_SCHEMA_VERSION_REQUIRED", app.Code)
+		}
+		if app.ExitCode != ExitValidation {
+			t.Fatalf("exit code = %d, want %d", app.ExitCode, ExitValidation)
+		}
+		if !strings.Contains(app.Message, "schema_version") {
+			t.Fatalf("message should mention schema_version: %q", app.Message)
+		}
+		if _, ok := app.Details["remediation"]; !ok {
+			t.Fatal("details must include a remediation hint")
+		}
+	})
+	t.Run("supported value accepted", func(t *testing.T) {
+		if err := ValidateSchemaVersion(SchemaVersion); err != nil {
+			t.Fatalf("current SchemaVersion must be accepted, got %v", err)
+		}
+	})
+	t.Run("unsupported value rejected", func(t *testing.T) {
+		err := ValidateSchemaVersion("99.99")
+		if err == nil {
+			t.Fatal("expected error for unsupported schema_version")
+		}
+		var app *AppError
+		if !errors.As(err, &app) {
+			t.Fatalf("expected AppError, got %T", err)
+		}
+		if app.Code != "VALIDATION_SCHEMA_VERSION_UNSUPPORTED" {
+			t.Fatalf("code = %q, want VALIDATION_SCHEMA_VERSION_UNSUPPORTED", app.Code)
+		}
+	})
+}
+
+func TestResolveTableDriven(t *testing.T) {
+	monitorIndex := 0
+	validCoordMap := NewCoordMap(Bounds{X: 10, Y: 20, Width: 1000, Height: 500}, Size{Width: 500, Height: 250}).String()
+
+	cases := []struct {
+		name    string
+		point   Point
+		rctx    ResolveContext
+		wantX   int
+		wantY   int
+		wantErr string // expected AppError.Code, or "" for success
+	}{
+		{
+			name:  "screen space passes through",
+			point: Point{X: 100, Y: 200, Space: CoordSpaceScreen},
+			wantX: 100, wantY: 200,
+		},
+		{
+			name:  "empty space defaults to screen",
+			point: Point{X: 5, Y: 6},
+			wantX: 5, wantY: 6,
+		},
+		{
+			name:  "screenshot maps via coord_map",
+			point: Point{X: 250, Y: 125, Space: CoordSpaceScreenshot, CoordMap: validCoordMap},
+			wantX: 510, wantY: 270,
+		},
+		{
+			name:    "screenshot without coord_map rejected",
+			point:   Point{X: 1, Y: 1, Space: CoordSpaceScreenshot},
+			wantErr: "COORD_MAP_REQUIRED",
+		},
+		{
+			name:    "screenshot out of bounds rejected",
+			point:   Point{X: 9999, Y: 9999, Space: CoordSpaceScreenshot, CoordMap: validCoordMap},
+			wantErr: "POINT_OUT_OF_BOUNDS",
+		},
+		{
+			name:    "window requires target",
+			point:   Point{X: 0, Y: 0, Space: CoordSpaceWindow},
+			wantErr: "COORD_TARGET_REQUIRED",
+		},
+		{
+			name:  "window resolves via client_bounds",
+			point: Point{X: 10, Y: 20, Space: CoordSpaceWindow, Target: WindowTarget{Title: "Firefox"}},
+			rctx: ResolveContext{Windows: []WindowInfo{{
+				ID: "0x1", Title: "Firefox",
+				Bounds:           Bounds{X: 100, Y: 200, Width: 800, Height: 600},
+				ClientBounds:     Bounds{X: 110, Y: 230, Width: 780, Height: 565},
+				DecorationInsets: DecorationInsets{Left: 10, Top: 30, Right: 10, Bottom: 5},
+			}}},
+			wantX: 120, wantY: 250,
+		},
+		{
+			name:  "window_frame uses outer bounds",
+			point: Point{X: 10, Y: 5, Space: CoordSpaceWindowFrame, Target: WindowTarget{Class: "fam-ui"}},
+			rctx: ResolveContext{Windows: []WindowInfo{{
+				ID: "0x1", Class: "fam-ui",
+				Bounds:           Bounds{X: 100, Y: 200, Width: 800, Height: 600},
+				ClientBounds:     Bounds{X: 110, Y: 230, Width: 780, Height: 565},
+				DecorationInsets: DecorationInsets{Left: 10, Top: 30, Right: 10, Bottom: 5},
+			}}},
+			wantX: 110, wantY: 205,
+		},
+		{
+			name:  "window with zero insets falls back to outer bounds",
+			point: Point{X: 5, Y: 6, Space: CoordSpaceWindow, Target: WindowTarget{ID: "0x1"}},
+			rctx: ResolveContext{Windows: []WindowInfo{{
+				ID: "0x1", XID: 1,
+				Bounds: Bounds{X: 50, Y: 60, Width: 400, Height: 300},
+			}}},
+			wantX: 55, wantY: 66,
+		},
+		{
+			name:    "window target not found",
+			point:   Point{X: 1, Y: 1, Space: CoordSpaceWindow, Target: WindowTarget{Title: "MissingApp"}},
+			rctx:    ResolveContext{Windows: []WindowInfo{{ID: "0x1", Title: "Firefox", Bounds: Bounds{X: 0, Y: 0, Width: 100, Height: 100}}}},
+			wantErr: "WINDOW_NOT_FOUND",
+		},
+		{
+			name:  "window target ambiguous",
+			point: Point{X: 1, Y: 1, Space: CoordSpaceWindow, Target: WindowTarget{Class: "term"}},
+			rctx: ResolveContext{Windows: []WindowInfo{
+				{ID: "0x1", Class: "term", Bounds: Bounds{X: 0, Y: 0, Width: 100, Height: 100}},
+				{ID: "0x2", Class: "term", Bounds: Bounds{X: 100, Y: 0, Width: 100, Height: 100}},
+			}},
+			wantErr: "WINDOW_AMBIGUOUS",
+		},
+		{
+			name:  "window coordinate out of bounds",
+			point: Point{X: 9999, Y: 9999, Space: CoordSpaceWindow, Target: WindowTarget{ID: "0x1"}},
+			rctx: ResolveContext{Windows: []WindowInfo{{
+				ID: "0x1", XID: 1,
+				Bounds:       Bounds{X: 0, Y: 0, Width: 200, Height: 100},
+				ClientBounds: Bounds{X: 0, Y: 20, Width: 200, Height: 80},
+			}}},
+			wantErr: "POINT_OUT_OF_BOUNDS",
+		},
+		{
+			name:    "monitor requires monitor_index",
+			point:   Point{X: 0, Y: 0, Space: CoordSpaceMonitor},
+			wantErr: "COORD_MONITOR_INDEX_REQUIRED",
+		},
+		{
+			name:  "monitor resolves with offset",
+			point: Point{X: 100, Y: 50, Space: CoordSpaceMonitor, MonitorIndex: &monitorIndex},
+			rctx:  ResolveContext{Monitors: []MonitorInfo{{Bounds: Bounds{X: 1920, Y: 0, Width: 1920, Height: 1080}}}},
+			wantX: 2020, wantY: 50,
+		},
+		{
+			name:    "monitor index out of range",
+			point:   Point{X: 0, Y: 0, Space: CoordSpaceMonitor, MonitorIndex: &monitorIndex},
+			rctx:    ResolveContext{Monitors: nil},
+			wantErr: "MONITOR_INDEX_OUT_OF_RANGE",
+		},
+		{
+			name:    "monitor coordinate out of bounds",
+			point:   Point{X: 5000, Y: 5000, Space: CoordSpaceMonitor, MonitorIndex: &monitorIndex},
+			rctx:    ResolveContext{Monitors: []MonitorInfo{{Bounds: Bounds{X: 0, Y: 0, Width: 1920, Height: 1080}}}},
+			wantErr: "POINT_OUT_OF_BOUNDS",
+		},
+		{
+			name:    "unknown space rejected",
+			point:   Point{X: 0, Y: 0, Space: "telepathy"},
+			wantErr: "INVALID_COORDINATE_SPACE",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			x, y, err := Resolve(tc.point, tc.rctx)
+			if tc.wantErr != "" {
+				if err == nil {
+					t.Fatalf("expected error %q, got success (%d,%d)", tc.wantErr, x, y)
+				}
+				var app *AppError
+				if !errors.As(err, &app) {
+					t.Fatalf("expected AppError, got %T: %v", err, err)
+				}
+				if app.Code != tc.wantErr {
+					t.Fatalf("code = %q, want %q", app.Code, tc.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if x != tc.wantX || y != tc.wantY {
+				t.Fatalf("got (%d,%d), want (%d,%d)", x, y, tc.wantX, tc.wantY)
+			}
+		})
+	}
+}
+
+func TestResolveRegion(t *testing.T) {
+	monitorIndex := 1
+	badMonitorIndex := 5
+
+	cases := []struct {
+		name    string
+		ref     RegionRef
+		rctx    ResolveContext
+		want    Bounds
+		wantErr string
+	}{
+		{
+			name: "screen space passthrough",
+			ref:  RegionRef{X: 100, Y: 200, Width: 50, Height: 60, Space: CoordSpaceScreen},
+			want: Bounds{X: 100, Y: 200, Width: 50, Height: 60},
+		},
+		{
+			name: "empty space defaults to screen",
+			ref:  RegionRef{X: 0, Y: 0, Width: 913, Height: 976},
+			want: Bounds{X: 0, Y: 0, Width: 913, Height: 976},
+		},
+		{
+			name: "window resolves via client_bounds",
+			ref:  RegionRef{X: 0, Y: 0, Width: 200, Height: 200, Space: CoordSpaceWindow, Target: WindowTarget{Class: "fam-ui"}},
+			rctx: ResolveContext{Windows: []WindowInfo{{
+				ID: "0x1", Class: "fam-ui",
+				Bounds:           Bounds{X: 100, Y: 200, Width: 800, Height: 600},
+				ClientBounds:     Bounds{X: 110, Y: 230, Width: 780, Height: 565},
+				DecorationInsets: DecorationInsets{Left: 10, Top: 30, Right: 10, Bottom: 5},
+			}}},
+			want: Bounds{X: 110, Y: 230, Width: 200, Height: 200},
+		},
+		{
+			name: "window_frame uses outer bounds",
+			ref:  RegionRef{X: 0, Y: 0, Width: 200, Height: 200, Space: CoordSpaceWindowFrame, Target: WindowTarget{Class: "fam-ui"}},
+			rctx: ResolveContext{Windows: []WindowInfo{{
+				ID: "0x1", Class: "fam-ui",
+				Bounds:           Bounds{X: 100, Y: 200, Width: 800, Height: 600},
+				ClientBounds:     Bounds{X: 110, Y: 230, Width: 780, Height: 565},
+				DecorationInsets: DecorationInsets{Left: 10, Top: 30, Right: 10, Bottom: 5},
+			}}},
+			want: Bounds{X: 100, Y: 200, Width: 200, Height: 200},
+		},
+		{
+			name: "window space with offset inside client_bounds",
+			ref:  RegionRef{X: 5, Y: 10, Width: 50, Height: 60, Space: CoordSpaceWindow, Target: WindowTarget{ID: "0x1"}},
+			rctx: ResolveContext{Windows: []WindowInfo{{
+				ID: "0x1", XID: 1,
+				Bounds:       Bounds{X: 0, Y: 0, Width: 800, Height: 600},
+				ClientBounds: Bounds{X: 10, Y: 30, Width: 780, Height: 565},
+			}}},
+			want: Bounds{X: 15, Y: 40, Width: 50, Height: 60},
+		},
+		{
+			name: "monitor resolves with offset",
+			ref:  RegionRef{X: 100, Y: 50, Width: 200, Height: 200, Space: CoordSpaceMonitor, MonitorIndex: &monitorIndex},
+			rctx: ResolveContext{Monitors: []MonitorInfo{
+				{Bounds: Bounds{X: 0, Y: 0, Width: 1920, Height: 1080}},
+				{Bounds: Bounds{X: 1920, Y: 0, Width: 1920, Height: 1080}},
+			}},
+			want: Bounds{X: 2020, Y: 50, Width: 200, Height: 200},
+		},
+		{
+			name:    "window without target rejected",
+			ref:     RegionRef{X: 0, Y: 0, Width: 10, Height: 10, Space: CoordSpaceWindow},
+			wantErr: "REGION_TARGET_REQUIRED",
+		},
+		{
+			name:    "window target not found",
+			ref:     RegionRef{X: 0, Y: 0, Width: 10, Height: 10, Space: CoordSpaceWindow, Target: WindowTarget{Class: "missing"}},
+			rctx:    ResolveContext{Windows: []WindowInfo{{ID: "0x1", Class: "fam-ui", Bounds: Bounds{X: 0, Y: 0, Width: 100, Height: 100}}}},
+			wantErr: "WINDOW_NOT_FOUND",
+		},
+		{
+			name: "window region out of bounds",
+			ref:  RegionRef{X: 0, Y: 0, Width: 9999, Height: 9999, Space: CoordSpaceWindow, Target: WindowTarget{ID: "0x1"}},
+			rctx: ResolveContext{Windows: []WindowInfo{{
+				ID: "0x1", XID: 1,
+				Bounds:       Bounds{X: 0, Y: 0, Width: 200, Height: 100},
+				ClientBounds: Bounds{X: 0, Y: 20, Width: 200, Height: 80},
+			}}},
+			wantErr: "REGION_OUT_OF_BOUNDS",
+		},
+		{
+			name:    "monitor without index rejected",
+			ref:     RegionRef{X: 0, Y: 0, Width: 10, Height: 10, Space: CoordSpaceMonitor},
+			wantErr: "REGION_MONITOR_INDEX_REQUIRED",
+		},
+		{
+			name:    "monitor index out of range",
+			ref:     RegionRef{X: 0, Y: 0, Width: 10, Height: 10, Space: CoordSpaceMonitor, MonitorIndex: &badMonitorIndex},
+			rctx:    ResolveContext{Monitors: []MonitorInfo{{Bounds: Bounds{X: 0, Y: 0, Width: 1920, Height: 1080}}}},
+			wantErr: "MONITOR_INDEX_OUT_OF_RANGE",
+		},
+		{
+			name:    "unknown space rejected",
+			ref:     RegionRef{X: 0, Y: 0, Width: 10, Height: 10, Space: "telepathy"},
+			wantErr: "INVALID_COORDINATE_SPACE",
+		},
+		{
+			name: "zero-size window region returns full client bounds",
+			ref:  RegionRef{Space: CoordSpaceWindow, Target: WindowTarget{ID: "0x1"}},
+			rctx: ResolveContext{Windows: []WindowInfo{{
+				ID: "0x1", XID: 1,
+				Bounds:       Bounds{X: 0, Y: 0, Width: 800, Height: 600},
+				ClientBounds: Bounds{X: 10, Y: 30, Width: 780, Height: 565},
+			}}},
+			want: Bounds{X: 10, Y: 30, Width: 780, Height: 565},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := ResolveRegion(tc.ref, tc.rctx)
+			if tc.wantErr != "" {
+				if err == nil {
+					t.Fatalf("expected error %q, got %+v", tc.wantErr, got)
+				}
+				var app *AppError
+				if !errors.As(err, &app) {
+					t.Fatalf("expected AppError, got %T: %v", err, err)
+				}
+				if app.Code != tc.wantErr {
+					t.Fatalf("code = %q, want %q", app.Code, tc.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got != tc.want {
+				t.Fatalf("got %+v, want %+v", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestRegionRefBareBoundsUnmarshal pins the v0.1/v0.2 wire shape: a
+// bare {x,y,width,height} JSON region must Unmarshal into a RegionRef
+// whose Space is "" (treated as screen) and whose Bounds() are intact.
+func TestRegionRefBareBoundsUnmarshal(t *testing.T) {
+	const payload = `{"x":1050,"y":123,"width":1276,"height":931}`
+	var ref RegionRef
+	if err := jsonUnmarshal(payload, &ref); err != nil {
+		t.Fatalf("unmarshal bare bounds failed: %v", err)
+	}
+	if ref.Space != "" {
+		t.Fatalf("expected empty Space for bare bounds, got %q", ref.Space)
+	}
+	if ref.Bounds() != (Bounds{X: 1050, Y: 123, Width: 1276, Height: 931}) {
+		t.Fatalf("bounds = %+v", ref.Bounds())
+	}
+	resolved, err := ResolveRegion(ref, ResolveContext{})
+	if err != nil {
+		t.Fatalf("ResolveRegion error: %v", err)
+	}
+	if resolved != ref.Bounds() {
+		t.Fatalf("expected passthrough resolve, got %+v", resolved)
+	}
+}
+
+// TestRegionRefExtendedUnmarshal verifies the new wire shape carries
+// space + target through Unmarshal so window-space callers can submit
+// the killer payload: {x,y,w,h,space:"window",target:{class:...}}.
+func TestRegionRefExtendedUnmarshal(t *testing.T) {
+	const payload = `{"x":0,"y":0,"width":200,"height":200,"space":"window","target":{"class":"fam-ui"}}`
+	var ref RegionRef
+	if err := jsonUnmarshal(payload, &ref); err != nil {
+		t.Fatalf("unmarshal extended region failed: %v", err)
+	}
+	if ref.Space != CoordSpaceWindow {
+		t.Fatalf("Space = %q, want %q", ref.Space, CoordSpaceWindow)
+	}
+	if ref.Target.Class != "fam-ui" {
+		t.Fatalf("Target.Class = %q, want fam-ui", ref.Target.Class)
+	}
+}
+
+func TestPointScreenPointStillRoutesThroughResolve(t *testing.T) {
+	// Backwards-compat shim: existing call sites that still call
+	// ScreenPoint() must continue to work for screen/screenshot.
+	p := Point{X: 7, Y: 8}
+	x, y, err := p.ScreenPoint()
+	if err != nil || x != 7 || y != 8 {
+		t.Fatalf("ScreenPoint screen passthrough = (%d,%d,%v)", x, y, err)
+	}
+}

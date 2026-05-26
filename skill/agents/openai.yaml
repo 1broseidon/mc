@@ -1,0 +1,4 @@
+interface:
+  display_name: "MyComputer"
+  short_description: "Linux desktop computer-use workflows"
+  default_prompt: "Use $my-computer to operate and verify a Linux desktop workflow."

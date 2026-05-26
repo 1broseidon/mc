@@ -1,0 +1,156 @@
+tool: mycomputer
+product: MyComputer
+module: github.com/1broseidon/mc
+kind: cli+mcp
+boundary: tool-scope
+callers:
+  - agent
+  - script
+  - human-operator
+surface_pattern: verb-surface-cli-with-mcp-first-tools
+stdout: data/results only
+stderr: diagnostics/progress/errors
+config_precedence:
+  - flags
+  - environment
+  - config_file
+  - defaults
+env_prefix: MYCOMPUTER_
+config_files:
+  - ./mycomputer.yaml
+  - $XDG_CONFIG_HOME/mycomputer/config.yaml
+  - ~/.config/mycomputer/config.yaml
+  - /etc/mycomputer/config.yaml
+global_flags:
+  --allow-close: permit window_close actions; disabled by default
+  --audit-full-payloads: persist a per-batch sealed payload manifest (clipboard content still redacted) so 'audit replay' can reconstruct full inputs
+  --audit-screenshots: capture and record before/after screenshots in the audit log (expensive)
+  --config: load config from an explicit file
+  --dry-run: validate and resolve actions without mutating the desktop (preview mode)
+  --json: emit machine-readable JSON for data commands
+  --logical-coords: "EXPERIMENTAL: translate between logical (scaled) and physical pixels using the primary monitor's RandR scale. Off by default"
+  --max-chars: truncate long textual fields to N characters (0 = default)
+  --minimal: emit bounded tab-separated output where supported
+  --no-color: disable ANSI output even on a TTY
+  --quiet: suppress non-essential diagnostics
+  --respect-user: yield to the human user when they are actively driving the desktop; pauses action batches when real input is detected (default true on interactive sessions)
+  --verbose: emit extra diagnostics to stderr
+exit_codes:
+  0: success
+  1: generic_or_unclassified_error
+  2: validation_error
+  3: not_found
+  4: dependency_unavailable
+  5: precondition_or_state_error
+  6: cancelled
+schema_versions:
+  - "0.2"
+  - "0.1"
+schema_version: "0.2"
+cli_commands:
+  - actions
+  - audit
+  - browse
+  - capture
+  - clipboard-read
+  - clipboard-status
+  - clipboard-write
+  - completion
+  - config
+  - conventions
+  - doctor
+  - find-color
+  - find-image
+  - find-text
+  - focus
+  - get-screen-info
+  - observe
+  - paste
+  - serve
+  - type-text
+  - version
+  - wait-for-pixel-change
+  - wait-for-text
+  - wait-for-window
+  - window-close
+  - window-maximize
+  - window-minimize
+  - window-move
+  - window-raise
+  - window-resize
+  - window-workspace
+  - windows
+mcp_server_id: my-computer
+mcp_tools:
+  read_only:
+    - clipboard_read
+    - doctor
+    - find_color
+    - find_image
+    - find_text
+    - focused_window
+    - get_screen_info
+    - list_windows
+    - observe
+    - screenshot
+    - wait_for_pixel_change
+    - wait_for_text
+    - wait_for_window
+  mutating:
+    - browser_pipeline
+    - browser_session
+    - click
+    - click_image
+    - click_text
+    - clipboard_write
+    - computer_actions
+    - drag
+    - focus_window
+    - move_mouse
+    - paste
+    - perform_action
+    - press_key
+    - scroll
+    - set_text
+    - type_text
+    - window_close
+    - window_maximize
+    - window_minimize
+    - window_move
+    - window_raise
+    - window_resize
+    - window_workspace
+doctor_backends:
+  - DISPLAY
+  - XAUTHORITY
+  - x11
+  - xtest
+  - randr
+  - xfixes
+  - at_spi
+  - browser
+  - ocr_tesseract
+  - template_match
+  - clipboard
+  - ime
+  - xinput2
+  - audit
+json_error_shape:
+  error:
+    code: STABLE_MACHINE_CODE
+    message: actionable human-readable message
+    details: optional object
+schema_governance:
+  rule: Wire-affecting changes during a release cycle require either (a) schema_version point-bump or (b) anvil.md ledger entry. No silent in-place mutation of shipped wire shapes.
+  ratified: 2026-05-26
+notes:
+  - No generic exec, shell, filesystem, or terminal command tool.
+  - Native Wayland control is out of MVP scope; doctor reports blockers.
+  - Screenshot responses include coord_map for screenshot-to-screen coordinate conversion.
+  - computer_actions request envelopes must carry schema_version="0.2"; v0.1 payloads are accepted for wire compatibility but rejected with VALIDATION_SCHEMA_VERSION_REQUIRED when the field is missing entirely.
+  - --allow-close gates window_close at server start; without it the tool returns PRECONDITION_CLOSE_NOT_ALLOWED.
+  - --logical-coords is experimental HiDPI translation; production agents should stay on physical pixels.
+  - --dry-run resolves and validates mutating actions without touching the desktop; result envelopes carry dry_run:true.
+  - --audit-screenshots captures before/after PNGs for every mutating action and records them in the audit log (expensive).
+  - --verbose is a global flag; per-command semantics opt in by reading rootOpts.Verbose. Currently observed by doctor (probe count + elapsed) and version (build metadata); other commands ignore it. Adding a new --verbose-aware command is a per-command change, not a flag change.
+  - This file is generated by 'mycomputer conventions emit'; CI runs 'mycomputer conventions emit --check' to prevent drift.

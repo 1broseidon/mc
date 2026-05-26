@@ -1,0 +1,9 @@
+bin/
+/mycomputer
+*.test
+coverage.out
+
+# Local development scaffolding — not part of the public release.
+.brainfile/
+.anvil/
+
