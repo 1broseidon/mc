@@ -14,13 +14,6 @@ in `anvil.md` for the rule.
 
 ## [Unreleased]
 
-### Changed
-
-- Public release prep: repo at `github.com/1broseidon/mc`, MIT license,
-  module path renamed from `mycomputer` to `github.com/1broseidon/mc`.
-  The binary, CLI verbs, MCP server_id (`my-computer`), wire envelopes,
-  and exit codes are unchanged.
-
 ## [0.3.0] — 2026-05-26
 
 The v0.3 polish release. Locks the public surface (CLI, MCP tools,
@@ -75,6 +68,26 @@ reproducible build metadata, and a top-level README.
   CLI + MCP surface. (task-18)
 - Audit hook verification for `window_close` — confirmed wired
   through the existing `writeAudit` path. (task-21)
+- `mcpserver.Catalog()` becomes the single source of truth for the
+  registered tool list. `diagnostic.AvailableTools` is now populated
+  via `Doctor(tools []string)` injection at call time so adding a
+  new MCP tool surfaces in `doctor.available_tools` without a manual
+  sync step. (task-22)
+- `Makefile` `lint` target — hard-fail gates on `go vet`, `gofmt`,
+  `staticcheck`, `deadcode`, and `golangci-lint`. Lint findings are
+  now zero across the chain. (task-23, task-24)
+- `.github/workflows/release.yml` + `.goreleaser.yaml` — release
+  pipeline triggered on `v*` tag push. Builds linux/amd64 +
+  linux/arm64, publishes the GitHub release with checksums.
+  (task-26)
+- `install.sh` — curl-pipe-sh installer for Linux user bin.
+  Verifies sha256 checksums, defaults `BIN_DIR=~/.local/bin`,
+  detects user shell for PATH guidance, shellcheck-clean.
+  Environment overrides: `VERSION=v0.3.0`, `BIN_DIR=/usr/local/bin`.
+  (task-27)
+- `LICENSE` — MIT, 2026. (task-25)
+- Top-level `README.md` in the cymbal/ketch style; quick-start
+  commands verified against the live binary. (task-18, task-25)
 
 ### Changed
 
@@ -88,6 +101,11 @@ reproducible build metadata, and a top-level README.
   `version`; remains a no-op on commands that don't opt in by
   reading `rootOpts.Verbose`. Documented in `conventions.yaml`
   notes. (task-13)
+- Public release prep: repo at `github.com/1broseidon/mc`, MIT
+  license, module path renamed from `mycomputer` to
+  `github.com/1broseidon/mc`. The binary (`mycomputer`), CLI verbs,
+  MCP server_id (`my-computer`), wire envelopes, and exit codes are
+  unchanged — the rename is repo/module only. (task-25)
 
 ### Documentation
 
