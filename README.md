@@ -212,6 +212,28 @@ The full operator-facing skill guide, including the
 observe -> target -> act -> verify loop and worked recipes, lives in
 [`skill/SKILL.md`](skill/SKILL.md).
 
+### Install the skill
+
+If your agent runtime supports skill packages, install MyComputer's
+skill directly from this repo:
+
+```sh
+npx skills add 1broseidon/mc
+```
+
+The skill description triggers on natural-language patterns like
+"use my computer to...", "screenshot my window", "click X on screen",
+or "find Y on the display" — no per-prompt wiring required. Once
+installed, the agent also knows how to detect MyComputer (via the
+MCP tool list or `which mycomputer`) and how to install it via
+`install.sh` if it's missing.
+
+The skill source ships under [`skill/`](skill/) in this repo:
+[`SKILL.md`](skill/SKILL.md) plus three reference docs covering
+[CLI recipes](skill/references/cli-recipes.md),
+[MCP tools](skill/references/mcp-tools.md), and
+[desktop workflows](skill/references/desktop-workflows.md).
+
 ## Documentation
 
 | Document | Purpose |
