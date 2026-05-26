@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"runtime"
+	"strings"
 	"time"
 
 	"github.com/1broseidon/mc/internal/a11y"
@@ -43,7 +44,9 @@ var ewmhAtomToCapability = []struct {
 // inject the catalog to keep AvailableTools drift-free.
 func Doctor(version contract.VersionInfo, cfg config.Effective, tools []string) contract.DoctorReport {
 	version.Go = runtime.Version()
+	autoDisplay := maybeAutoDetectDisplay()
 	backends := x11.Probe()
+	annotateDisplayAutoDetect(backends, autoDisplay)
 	annotateEWMHCapabilities(backends)
 	backends = append(backends, a11y.Probe())
 	backends = append(backends, browser.Probe(cfg.BrowserBin, cfg.BrowserEndpoint))
@@ -102,6 +105,13 @@ func Doctor(version contract.VersionInfo, cfg config.Effective, tools []string) 
 	if len(blockers) > 0 {
 		status = "blocked"
 		next = "resolve readiness blockers before invoking mutating desktop tools"
+		// task-28: when DISPLAY is unset and auto-probe could not pick
+		// a singular live X server, surface a remediation hint that
+		// covers the MCP-host env-inheritance footgun (Codex, Claude
+		// Code, etc. spawned from a non-X-aware shell).
+		if session.Display == "" {
+			next = displayRemediationHint(autoDisplay)
+		}
 	}
 	return contract.DoctorReport{
 		Product:        "MyComputer",
@@ -180,6 +190,78 @@ func probeAudit(now time.Time) contract.BackendStatus {
 			"today_bytes":    res.TodayBytes,
 		},
 		CheckedAt: now,
+	}
+}
+
+// maybeAutoDetectDisplay runs the /tmp/.X11-unix/ socket probe only
+// when DISPLAY is unset/empty and, on a singular live socket, sets
+// DISPLAY for the current mc process via os.Setenv. Explicit DISPLAY
+// values are respected — the function returns an empty result and the
+// existing env is left alone. This addresses the MCP-host case where
+// Codex / Claude Code spawn 'mycomputer serve' from a non-X-aware shell
+// (.desktop launchers, systemd user units, IDE integrated terminals)
+// without DISPLAY in their inherited env.
+//
+// Constraint: NEVER mutate the caller's shell env — os.Setenv only
+// affects this process and its children.
+func maybeAutoDetectDisplay() x11.AutoDetectResult {
+	if os.Getenv("DISPLAY") != "" {
+		return x11.AutoDetectResult{}
+	}
+	res := x11.AutoDetectDisplay()
+	if res.Display != "" {
+		_ = os.Setenv("DISPLAY", res.Display)
+	}
+	return res
+}
+
+// annotateDisplayAutoDetect rewrites the DISPLAY backend row to reflect
+// the auto-probe outcome when DISPLAY was previously unset. Three cases:
+//
+//   - singular live socket: row becomes ready=true with the auto-detected
+//     value and a message identifying the source socket;
+//   - multiple live sockets: row stays not-ready but the message lists
+//     the ambiguous candidates so the user can pick explicitly;
+//   - no live sockets: row keeps its default "not set" message.
+//
+// When DISPLAY was already set the row is untouched.
+func annotateDisplayAutoDetect(backends []contract.BackendStatus, res x11.AutoDetectResult) {
+	if res.Display == "" && len(res.Ambiguous) == 0 {
+		return
+	}
+	for i := range backends {
+		if backends[i].Name != "DISPLAY" {
+			continue
+		}
+		if res.Display != "" {
+			backends[i].Ready = true
+			backends[i].Message = "auto-detected " + res.Display + " from " + res.Source
+			if backends[i].Details == nil {
+				backends[i].Details = map[string]any{}
+			}
+			backends[i].Details["value"] = res.Display
+			backends[i].Details["auto_detected"] = true
+			backends[i].Details["source"] = res.Source
+			return
+		}
+		// Ambiguous: leave Ready=false but explain the candidates.
+		backends[i].Message = "DISPLAY_AMBIGUOUS: multiple live X servers (" + strings.Join(res.Ambiguous, ", ") + "); set DISPLAY explicitly or pass 'mycomputer serve --display <value>'"
+		if backends[i].Details == nil {
+			backends[i].Details = map[string]any{}
+		}
+		backends[i].Details["candidates"] = res.Ambiguous
+		return
+	}
+}
+
+// displayRemediationHint returns the next-action string for the
+// DISPLAY-unset blocked state, tailored to what the auto-probe found.
+func displayRemediationHint(res x11.AutoDetectResult) string {
+	switch {
+	case len(res.Ambiguous) > 0:
+		return "DISPLAY is unset and /tmp/.X11-unix/ has multiple live sockets (" + strings.Join(res.Ambiguous, ", ") + "); pick one via 'mycomputer serve --display <value>' or export DISPLAY before launching the MCP host"
+	default:
+		return "DISPLAY is unset and no live X server was found in /tmp/.X11-unix/; launch the MCP host from an X session OR set DISPLAY explicitly via 'mycomputer serve --display :0'"
 	}
 }
 

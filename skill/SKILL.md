@@ -144,6 +144,41 @@ go install github.com/1broseidon/mc/cmd/mycomputer@latest
 
 After registration the MCP host exposes the `my-computer` tool surface.
 
+### MCP host DISPLAY
+
+`mycomputer serve` needs `DISPLAY` set to reach the X server. When an MCP
+host (Claude Code, Codex, Gemini CLI, …) is launched from a non-X-aware
+parent — a `.desktop` launcher, a systemd user unit, an IDE integrated
+terminal — `DISPLAY` is usually missing from its inherited env, so the
+spawned `mycomputer serve` child sees it missing too. This was the single
+biggest cause of `doctor` reporting blocked under MCP in v0.3.
+
+As of v0.3.1 the server resolves this in two ways:
+
+1. **Auto-probe**: when `DISPLAY` is unset, `mycomputer` scans
+   `/tmp/.X11-unix/` for active X server sockets. If exactly one is live
+   it sets `DISPLAY` for its own process and `doctor` reports
+   `auto-detected :N from /tmp/.X11-unix/X<N>`. The parent shell's env
+   is never modified. If multiple are live the row reports
+   `DISPLAY_AMBIGUOUS` with the candidate list and refuses to auto-pick.
+2. **Explicit override**: pass `--display :N` to `serve` to force a
+   specific value (useful when auto-probe is ambiguous or unwanted):
+
+   ```jsonc
+   {
+     "mcpServers": {
+       "my-computer": {
+         "command": "mycomputer",
+         "args": ["serve", "--display", ":0"]
+       }
+     }
+   }
+   ```
+
+If `doctor` still reports `DISPLAY` blocked, either launch the MCP host
+from an X-aware shell (one where `echo $DISPLAY` is non-empty) or use
+the explicit override above.
+
 ## Operating Rules
 
 1. **Detect first, install if needed, then call `doctor`.** Don't assume.

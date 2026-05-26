@@ -1,7 +1,12 @@
 package x11
 
 import (
+	"net"
 	"os"
+	"path/filepath"
+	"regexp"
+	"sort"
+	"strconv"
 	"time"
 
 	"github.com/jezek/xgb"
@@ -12,6 +17,87 @@ import (
 
 	"github.com/1broseidon/mc/internal/contract"
 )
+
+// x11SocketDir is the canonical X11 unix-socket directory. Override in
+// tests via AutoDetectDisplayIn() rather than mutating this var directly.
+const x11SocketDir = "/tmp/.X11-unix"
+
+// x11SocketName matches the X11 server socket pattern "X<N>" where N is
+// the display number (typically 0, 1, 2, …). Anchored to reject
+// adjacent helper sockets some compositors drop in the same directory.
+var x11SocketName = regexp.MustCompile(`^X(\d+)$`)
+
+// AutoDetectResult describes the outcome of an auto-probe over
+// /tmp/.X11-unix/. Exactly one of Display / Ambiguous / Empty is the
+// authoritative outcome (in that priority order):
+//
+//   - Display != "" → exactly one live socket; safe to os.Setenv("DISPLAY", Display).
+//   - len(Ambiguous) > 1 → multiple live sockets; caller must NOT auto-set.
+//   - Empty=true → no live sockets found.
+//
+// Source records the socket path (e.g. /tmp/.X11-unix/X1) that produced
+// the singular Display value, for surfacing in doctor messages.
+type AutoDetectResult struct {
+	Display   string
+	Source    string
+	Ambiguous []string
+	Empty     bool
+}
+
+// AutoDetectDisplay scans /tmp/.X11-unix/ for active X server sockets
+// and returns the canonical result. It does NOT mutate process env —
+// callers decide whether to os.Setenv based on the result. Probe is
+// cheap: net.Dial("unix", ...) with a 100ms timeout per candidate.
+func AutoDetectDisplay() AutoDetectResult {
+	return AutoDetectDisplayIn(x11SocketDir, 100*time.Millisecond)
+}
+
+// AutoDetectDisplayIn is the parameterised form of AutoDetectDisplay
+// used by tests. The dir argument is the X11 socket directory and
+// perCandidateTimeout caps each individual unix-socket dial.
+func AutoDetectDisplayIn(dir string, perCandidateTimeout time.Duration) AutoDetectResult {
+	entries, err := os.ReadDir(dir)
+	if err != nil || len(entries) == 0 {
+		return AutoDetectResult{Empty: true}
+	}
+	type candidate struct {
+		n      int
+		socket string
+	}
+	var live []candidate
+	for _, e := range entries {
+		m := x11SocketName.FindStringSubmatch(e.Name())
+		if m == nil {
+			continue
+		}
+		n, err := strconv.Atoi(m[1])
+		if err != nil {
+			continue
+		}
+		sockPath := filepath.Join(dir, e.Name())
+		conn, err := net.DialTimeout("unix", sockPath, perCandidateTimeout)
+		if err != nil {
+			continue
+		}
+		_ = conn.Close()
+		live = append(live, candidate{n: n, socket: sockPath})
+	}
+	if len(live) == 0 {
+		return AutoDetectResult{Empty: true}
+	}
+	sort.Slice(live, func(i, j int) bool { return live[i].n < live[j].n })
+	if len(live) == 1 {
+		return AutoDetectResult{
+			Display: ":" + strconv.Itoa(live[0].n),
+			Source:  live[0].socket,
+		}
+	}
+	amb := make([]string, 0, len(live))
+	for _, c := range live {
+		amb = append(amb, ":"+strconv.Itoa(c.n))
+	}
+	return AutoDetectResult{Ambiguous: amb}
+}
 
 type Display struct {
 	Conn        *xgb.Conn
