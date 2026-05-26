@@ -1,4 +1,5 @@
 bin/
+dist/
 /mycomputer
 *.test
 coverage.out

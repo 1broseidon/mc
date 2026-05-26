@@ -1,0 +1,63 @@
+version: 2
+
+project_name: mc
+
+builds:
+  - id: mycomputer
+    main: ./cmd/mycomputer
+    binary: mycomputer
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w
+      - -X main.version=v{{ .Version }}
+      - -X main.commit={{ .ShortCommit }}
+      - -X main.built={{ .Date }}
+
+archives:
+  - id: mycomputer
+    ids:
+      - mycomputer
+    formats:
+      - tar.gz
+    name_template: "mycomputer_{{ .Version }}_linux_{{ .Arch }}"
+
+checksum:
+  name_template: checksums.txt
+
+snapshot:
+  version_template: "{{ .Version }}-next"
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^chore:"
+      - "^ci:"
+
+brews:
+  - name: mc
+    ids:
+      - mycomputer
+    repository:
+      owner: 1broseidon
+      name: homebrew-tap
+      branch: main
+      token: "{{ .Env.HOMEBREW_TAP_GITHUB_TOKEN }}"
+    directory: Formula
+    commit_author:
+      name: github-actions[bot]
+      email: 41898282+github-actions[bot]@users.noreply.github.com
+    commit_msg_template: "formula: update mc to {{ .Tag }}"
+    homepage: https://github.com/1broseidon/mc
+    description: Linux desktop automation MCP server (X11 + XTest)
+    license: MIT
+    install: |
+      bin.install "mycomputer"
