@@ -234,9 +234,9 @@ func TestBatch_EmptyActions(t *testing.T) {
 				t.Fatalf("json.Marshal: %v", marshalErr)
 			}
 			var probe struct {
-				SchemaVersion            string         `json:"schema_version"`
+				SchemaVersion            string           `json:"schema_version"`
 				Results                  *json.RawMessage `json:"results"`
-				LastCompletedActionIndex int            `json:"last_completed_action_index"`
+				LastCompletedActionIndex int              `json:"last_completed_action_index"`
 			}
 			if err := json.Unmarshal(raw, &probe); err != nil {
 				t.Fatalf("json.Unmarshal: %v\nraw=%s", err, raw)
