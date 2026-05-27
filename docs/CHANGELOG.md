@@ -14,6 +14,36 @@ in `anvil.md` for the rule.
 
 ## [Unreleased]
 
+## [0.3.3] — 2026-05-27
+
+Revert-and-ship. Validation against the live v0.3.2 binary showed that
+the new geometry-divergence heuristic ("outside-desktop sampling +
+multi-edge consensus") produced **false positives on every dark-theme
+app** on a stock Cinnamon dev rig (Brave, Code, ghostty, Plank, Conky,
+TradingView). Root cause: the new heuristic samples a desktop reference
+patch; if both the wallpaper and the in-window content are dark solid
+colors, match_fraction trivially hits 1.0 and the warning fires.
+
+v0.3.3 reverts `internal/window/divergence.go` and `divergence_test.go`
+to the v0.3.1 implementation (corner-patch vs root-color, the version
+that karen verified produced zero false positives on the same mix of
+windows). The other four v0.3.2 fixes — shared DISPLAY auto-probe,
+MCP AppError-as-IsError JSON, OCR unique tmpdir, and OCR retry on
+OUTPUT_MISSING — remain in place.
+
+### Reverted
+
+- `WINDOW_GEOMETRY_DIVERGED` heuristic — restored to the v0.3.1
+  corner-patch-vs-root-color implementation. The v0.3.2 "outside
+  desktop + edge consensus" approach is documented as a v0.4 design
+  candidate: it needs a wallpaper-texture validation step to handle
+  solid-color dark themes.
+
+### Schema versions
+
+- `schema_version` remains `"0.2"`. Supported list: `["0.2", "0.1"]`.
+  No wire-shape mutations in v0.3.3.
+
 ## [0.3.2] — 2026-05-27
 
 Review-agent patch. A second-pass agent review found that the v0.3.1
