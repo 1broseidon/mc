@@ -14,6 +14,53 @@ in `anvil.md` for the rule.
 
 ## [Unreleased]
 
+## [0.3.4] — 2026-05-27
+
+Codex-dogfood v2. After v0.3.3 a second Codex pass scored 8.1/10 and
+flagged three remaining issues plus an OCR limitation. v0.3.4 closes the
+three (the OCR limitation moves to v0.4).
+
+### Added
+
+- **Texture-aware `WINDOW_GEOMETRY_DIVERGED` heuristic** — replaces the
+  v0.3.1 corner-vs-root sampling. Samples 3 candidate desktop reference
+  patches at screen edges (filtered against the visible-window list),
+  picks the highest-variance survivor above
+  `minimumDesktopVarianceThreshold`, and requires BOTH per-channel
+  color tolerance AND 8-bin histogram intersection (≥0.8) to fire. The
+  variance gate eliminates the v0.3.2 false-positive class where solid
+  dark wallpapers matched solid dark UIs trivially. Returns nil on
+  undecidable rigs (no high-variance desktop available) instead of
+  guessing. (task-31)
+- **`make install` dev-loop target** — builds the current source tree
+  with ldflags and overwrites `~/.local/bin/mycomputer`. Use before
+  `/release` to smoke MCP behavior against HEAD without burning a
+  release tag per iteration. Override via `INSTALL_DIR=/path make install`.
+
+### Changed
+
+- `computer_actions` empty / no-op response envelope — always populates
+  `schema_version:"0.2"` and `results:[]` (was returning
+  `schema_version:""` and `results:null` on empty actions, `resume_from`
+  past end, etc). `last_completed_action_index = -1` is the documented
+  convention for "no actions executed". The previous
+  `EMPTY_ACTION_BATCH` validation error is removed: empty batches are
+  now a valid no-op. (task-32)
+- Oversized region requests clamp by default instead of returning empty
+  metadata. `ScreenshotResult`, `FindResult`, `PixelResult`, and
+  `TextResult` surface optional `region_clamped:true`,
+  `original_region`, and `clamped_region` fields when the requested
+  region exceeded the resolved-space bounds. New `RegionRef.Strict`
+  field (default false) preserves the fail-loudly path by returning
+  `REGION_OUT_OF_BOUNDS`. Affects screenshot, find_text, find_image,
+  find_color, wait_for_pixel_change, wait_for_text. (task-33)
+
+### Schema versions
+
+- `schema_version` remains `"0.2"`. Supported list: `["0.2", "0.1"]`.
+  No wire-shape mutations in v0.3.4 — every change is additive
+  (new optional fields, new clamp semantics, new advisory warning).
+
 ## [0.3.3] — 2026-05-27
 
 Revert-and-ship. Validation against the live v0.3.2 binary showed that
