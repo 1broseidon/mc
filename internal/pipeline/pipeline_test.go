@@ -1,6 +1,8 @@
 package pipeline
 
 import (
+	"context"
+	"encoding/json"
 	"strings"
 	"testing"
 
@@ -153,5 +155,207 @@ func TestPointResolveCandidates(t *testing.T) {
 func TestExportedAPIKeepalive(t *testing.T) {
 	if t == nil { // never true; branch is for the static call graph only
 		SetAuditWriter(nil)
+	}
+}
+
+// TestBatch_EmptyActions pins the v0.3.4 fix for task-32: an empty
+// actions array must not return an error envelope or a zero-value
+// BatchResult. The success-shaped response must echo
+// schema_version="0.2", results:[] (non-nil so JSON serializes as []
+// rather than null), and last_completed_action_index=-1 per the
+// "nothing executed" convention documented on the BatchResult struct.
+//
+// Codex's v0.3.3 dogfood surfaced the bug as:
+//
+//	last_completed_action_index:0, results:null, schema_version:""
+//
+// Each sub-test guards one of those three fields. The test also
+// serializes the result through encoding/json so the nil-vs-empty-slice
+// distinction is verified on the wire, not just in the Go struct.
+func TestBatch_EmptyActions(t *testing.T) {
+	cases := []struct {
+		name  string
+		batch ActionBatch
+	}{
+		{
+			name: "empty_actions",
+			batch: ActionBatch{
+				SchemaVersion: contract.SchemaVersion,
+				Actions:       []Action{},
+			},
+		},
+		{
+			name: "resume_from_past_end_with_actions",
+			// resume_from past len(actions) is a benign no-op success
+			// path: agents stitching a resume cycle after the final
+			// action completed should not have to special-case it.
+			batch: ActionBatch{
+				SchemaVersion: contract.SchemaVersion,
+				Actions:       []Action{{Type: "observe"}},
+				ResumeFrom:    5,
+			},
+		},
+		{
+			name: "resume_from_equals_len_actions",
+			batch: ActionBatch{
+				SchemaVersion: contract.SchemaVersion,
+				Actions:       []Action{{Type: "observe"}, {Type: "observe"}},
+				ResumeFrom:    2,
+			},
+		},
+		{
+			name: "empty_actions_with_resume_from",
+			batch: ActionBatch{
+				SchemaVersion: contract.SchemaVersion,
+				Actions:       []Action{},
+				ResumeFrom:    3,
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			out, err := Run(context.Background(), tc.batch)
+			if err != nil {
+				t.Fatalf("Run returned error on no-op batch: %v", err)
+			}
+			if out.SchemaVersion != contract.SchemaVersion {
+				t.Fatalf("SchemaVersion=%q want %q (envelope must always echo the negotiated version)", out.SchemaVersion, contract.SchemaVersion)
+			}
+			if out.Results == nil {
+				t.Fatalf("Results is nil; want non-nil empty slice so JSON serializes as [] not null")
+			}
+			if len(out.Results) != 0 {
+				t.Fatalf("Results has %d entries; want 0", len(out.Results))
+			}
+			// Serialize through JSON and assert the wire shape — this
+			// is the regression guard agents (Codex) actually consume.
+			raw, marshalErr := json.Marshal(out)
+			if marshalErr != nil {
+				t.Fatalf("json.Marshal: %v", marshalErr)
+			}
+			var probe struct {
+				SchemaVersion            string         `json:"schema_version"`
+				Results                  *json.RawMessage `json:"results"`
+				LastCompletedActionIndex int            `json:"last_completed_action_index"`
+			}
+			if err := json.Unmarshal(raw, &probe); err != nil {
+				t.Fatalf("json.Unmarshal: %v\nraw=%s", err, raw)
+			}
+			if probe.SchemaVersion != contract.SchemaVersion {
+				t.Fatalf("wire schema_version=%q want %q\nraw=%s", probe.SchemaVersion, contract.SchemaVersion, raw)
+			}
+			if probe.Results == nil {
+				t.Fatalf("wire results is missing or null; want []\nraw=%s", raw)
+			}
+			if string(*probe.Results) != "[]" {
+				t.Fatalf("wire results=%s want []\nraw=%s", *probe.Results, raw)
+			}
+		})
+	}
+}
+
+// TestBatch_EmptyActions_LastCompletedActionIndex pins the documented
+// convention for LastCompletedActionIndex in no-op batches:
+//
+//   - empty actions, resume_from=0 → -1 (nothing executed or skipped)
+//   - empty actions, resume_from>0 → -1 (resume_from is clamped to
+//     len(actions)=0; no audit records emitted, nothing to "last
+//     complete")
+//   - non-empty actions, resume_from past end → the last skipped
+//     index (len(actions)-1), because the audit replay loop is clamped
+//     to len(actions) and emits a skipped record for each action in
+//     the input array.
+//
+// The split between -1 and "last skipped index" is the unambiguous
+// signal agents use to distinguish "nothing happened" from "all
+// actions were already done".
+func TestBatch_EmptyActions_LastCompletedActionIndex(t *testing.T) {
+	cases := []struct {
+		name string
+		in   ActionBatch
+		want int
+	}{
+		{
+			name: "empty_actions_resume_zero",
+			in: ActionBatch{
+				SchemaVersion: contract.SchemaVersion,
+				Actions:       []Action{},
+			},
+			want: -1,
+		},
+		{
+			name: "empty_actions_resume_nonzero",
+			in: ActionBatch{
+				SchemaVersion: contract.SchemaVersion,
+				Actions:       []Action{},
+				ResumeFrom:    3,
+			},
+			want: -1,
+		},
+		{
+			name: "resume_from_past_end",
+			in: ActionBatch{
+				SchemaVersion: contract.SchemaVersion,
+				Actions:       []Action{{Type: "observe"}, {Type: "observe"}},
+				ResumeFrom:    5,
+			},
+			want: 1, // last clamped skipped index = len(actions)-1
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			out, err := Run(context.Background(), tc.in)
+			if err != nil {
+				t.Fatalf("Run: %v", err)
+			}
+			if out.LastCompletedActionIndex != tc.want {
+				t.Fatalf("LastCompletedActionIndex=%d want %d", out.LastCompletedActionIndex, tc.want)
+			}
+		})
+	}
+}
+
+// TestBatch_NegativeResumeFromStillRejected guards the one structural
+// invariant we still enforce: resume_from < 0 has no defensible
+// meaning, so it returns a VALIDATION envelope rather than degrading
+// to a no-op. Pairs with TestBatch_EmptyActions which exercises the
+// other half of the contract change (>= len(actions) is now benign).
+func TestBatch_NegativeResumeFromStillRejected(t *testing.T) {
+	_, err := Run(context.Background(), ActionBatch{
+		SchemaVersion: contract.SchemaVersion,
+		Actions:       []Action{{Type: "observe"}},
+		ResumeFrom:    -1,
+	})
+	if err == nil {
+		t.Fatalf("Run(resume_from=-1) returned nil error; want VALIDATION RESUME_FROM_OUT_OF_RANGE")
+	}
+	var appErr *contract.AppError
+	if !errorsAs(err, &appErr) {
+		t.Fatalf("expected *contract.AppError, got %T: %v", err, err)
+	}
+	if appErr.Code != "RESUME_FROM_OUT_OF_RANGE" {
+		t.Fatalf("code=%q want RESUME_FROM_OUT_OF_RANGE", appErr.Code)
+	}
+}
+
+// errorsAs is a tiny shim around errors.As so the pin-test file does
+// not need the full "errors" import. Keeping the helper local avoids
+// adding a new top-level import that ripples through unrelated test
+// files.
+func errorsAs(err error, target **contract.AppError) bool {
+	for {
+		if err == nil {
+			return false
+		}
+		if ae, ok := err.(*contract.AppError); ok {
+			*target = ae
+			return true
+		}
+		type unwrap interface{ Unwrap() error }
+		u, ok := err.(unwrap)
+		if !ok {
+			return false
+		}
+		err = u.Unwrap()
 	}
 }

@@ -320,11 +320,15 @@ func Run(ctx context.Context, batch ActionBatch) (BatchResult, error) {
 	if err := contract.ValidateSchemaVersion(batch.SchemaVersion); err != nil {
 		return BatchResult{}, err
 	}
-	if len(batch.Actions) == 0 {
-		return BatchResult{}, contract.Validation("EMPTY_ACTION_BATCH", "actions requires at least one action", nil)
-	}
-	if batch.ResumeFrom < 0 || batch.ResumeFrom > len(batch.Actions) {
-		return BatchResult{}, contract.Validation("RESUME_FROM_OUT_OF_RANGE", "resume_from must be between 0 and len(actions)", map[string]any{"resume_from": batch.ResumeFrom, "actions": len(batch.Actions)})
+	// Negative resume_from is the only structurally invalid value;
+	// resume_from >= len(actions) (including the empty-actions case)
+	// is treated as a benign no-op success path so agents stitching
+	// resume cycles can re-submit without branching on edge cases.
+	// The response still carries schema_version + results:[] +
+	// last_completed_action_index=-1 (or the last skipped index when
+	// resume_from > 0) so callers can iterate the envelope uniformly.
+	if batch.ResumeFrom < 0 {
+		return BatchResult{}, contract.Validation("RESUME_FROM_OUT_OF_RANGE", "resume_from must be >= 0", map[string]any{"resume_from": batch.ResumeFrom, "actions": len(batch.Actions)})
 	}
 	if batch.BatchID == "" {
 		batch.BatchID = newBatchID()
@@ -336,12 +340,28 @@ func Run(ctx context.Context, batch ActionBatch) (BatchResult, error) {
 	// short-circuits the loop.
 	writeBatchPayload(batch)
 	bctx := imageutil.NewBatchContext()
+	// out is constructed up front so EVERY success-path return —
+	// including the empty-actions and resume_from-past-end no-op
+	// paths — carries a populated envelope: SchemaVersion echoes the
+	// negotiated contract version, Results is a non-nil slice (so
+	// JSON serializes as [] not null), and LastCompletedActionIndex
+	// defaults to -1 per the struct's documented "nothing executed"
+	// convention. Regression guard: task-32 fixed a v0.3.3 bug where
+	// an early return shipped a zero-value BatchResult.
 	out := BatchResult{
 		SchemaVersion:            contract.SchemaVersion,
 		Results:                  []contract.ActionResult{},
 		BatchID:                  batch.BatchID,
 		DryRun:                   batch.DryRun,
 		LastCompletedActionIndex: -1,
+	}
+	// Empty actions: no audit records, no yield watcher spin-up, just
+	// echo the envelope and return success. Agents that submit an
+	// empty batch are typically probing schema negotiation or running
+	// a no-op resume cycle; treating it as a hard error broke that
+	// path.
+	if len(batch.Actions) == 0 {
+		return out, nil
 	}
 
 	// Yield setup: when RespectUser is on AND xinput is available we
@@ -375,8 +395,17 @@ func Run(ctx context.Context, batch ActionBatch) (BatchResult, error) {
 	}
 
 	// resume_from: replay skipped actions to the audit log so agents
-	// can stitch the trail across re-submissions.
-	for i := 0; i < batch.ResumeFrom; i++ {
+	// can stitch the trail across re-submissions. The loop is clamped
+	// to len(batch.Actions) so a resume_from past the end of the
+	// input array degrades to a benign no-op (the success envelope
+	// carries LastCompletedActionIndex from the last skipped slot, or
+	// -1 when resume_from is 0). Without clamping, batch.Actions[i]
+	// would panic on out-of-range index.
+	replayCap := batch.ResumeFrom
+	if replayCap > len(batch.Actions) {
+		replayCap = len(batch.Actions)
+	}
+	for i := 0; i < replayCap; i++ {
 		writeAudit(audit.Record{
 			BatchID:     batch.BatchID,
 			ActionIndex: i,
