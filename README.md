@@ -46,6 +46,13 @@ go install github.com/1broseidon/mc/cmd/mycomputer@latest
 
 Or grab a binary from [releases](https://github.com/1broseidon/mc/releases).
 
+If you're hacking on `mc` itself, `make install` builds the current source
+tree and overwrites `~/.local/bin/mycomputer` (override with
+`INSTALL_DIR=/path make install`). The release pipeline still ships
+a clean `-trimpath` build from the tag; `make install` is the dev-loop
+smoke path — replace the local binary with HEAD, validate, then
+`/release` only after the local smoke is green.
+
 The project ships as the `mycomputer` binary, not `mc`. The short repo name
 is for the URL; the long binary name avoids the established `mc` in
 Midnight Commander and MinIO Client. The brand in prose is "MyComputer".

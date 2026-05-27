@@ -59,7 +59,7 @@ RELEASE_LDFLAGS := -s -w $(LDFLAGS)
 
 # --- Targets ---------------------------------------------------------------
 
-.PHONY: build release test lint conventions-check clean
+.PHONY: build release install test lint conventions-check clean
 
 build:
 	@mkdir -p $(BIN_DIR)
@@ -68,6 +68,18 @@ build:
 release:
 	@mkdir -p $(BIN_DIR)
 	go build -trimpath -ldflags "$(RELEASE_LDFLAGS)" -o $(BIN) $(CMD)
+
+# install builds the dev binary and overwrites the user's mycomputer at
+# $(INSTALL_DIR) — defaults to ~/.local/bin so MCP hosts resolve the
+# locally-built binary instead of whatever release tarball is installed.
+# Use this before /release to smoke-test the candidate commit; the
+# release pipeline still ships a clean -trimpath build from the tag.
+INSTALL_DIR ?= $(HOME)/.local/bin
+install: build
+	@mkdir -p $(INSTALL_DIR)
+	install -m 755 $(BIN) $(INSTALL_DIR)/mycomputer
+	@echo "installed dev build to $(INSTALL_DIR)/mycomputer"
+	@$(INSTALL_DIR)/mycomputer version
 
 test:
 	go test ./...
