@@ -12,33 +12,77 @@ import (
 )
 
 // divergenceProbeSize is the square edge length (in pixels) of the
-// patch sampled at the bottom-right interior corner of client_bounds
-// during the WINDOW_GEOMETRY_DIVERGED post-op check. Small enough that
-// the extra XGetImage round-trip stays cheap; large enough that a
-// distinct dominant color reliably emerges.
+// patches sampled at the bottom-right interior corner of client_bounds
+// and at the desktop reference candidate locations. Small enough that
+// each XGetImage round-trip stays cheap; large enough that a stable
+// per-channel variance and histogram emerge from real wallpaper.
 const divergenceProbeSize = 50
 
 // divergenceMatchTolerance is the per-channel tolerance used when
-// counting "matches root color" pixels in the sampled patch.
+// counting "matches desktop reference color" pixels in the sampled
+// window patch. Mirrors the v0.3.1 tolerance — wide enough to absorb
+// JPEG/scaling noise on wallpaper photos.
 const divergenceMatchTolerance = 15
 
 // divergenceMatchFraction is the patch-match fraction at or above
-// which we emit WINDOW_GEOMETRY_DIVERGED. Empirically 0.7 (70%) keeps
-// well-behaved GTK/Qt apps quiet while flagging the Gio/ImGui
-// "rendered surface didn't follow the WM resize" failure mode.
+// which the per-channel color check votes "patch ≈ desktop". 0.7 was
+// the empirically calibrated threshold in v0.3.1 for the Gio/ImGui
+// "rendered surface didn't follow the WM resize" failure mode; we
+// retain it as one of two gates (the histogram check below is the
+// second).
 const divergenceMatchFraction = 0.7
+
+// minimumDesktopVarianceThreshold is the lower bound on combined
+// (R+G+B) per-channel variance that a candidate patch must exceed to
+// be eligible as the desktop reference. The intent is to reject solid
+// or near-solid color samples that would let any dark/black app
+// trivially "match" the reference (the v0.3.2 false-positive failure
+// mode). A flat black or solid color patch has per-channel variance
+// ≈0; a subtle gradient has per-channel variance in the low tens; a
+// real photo/wallpaper with texture or shading has per-channel
+// variance in the hundreds-to-thousands range. 30 per channel (×3 =
+// 90 summed) sits comfortably above flat/solid and below any real
+// wallpaper we've observed. When no candidate clears this bar the
+// divergence check returns nil — the heuristic is undecidable on a
+// solid-color rig.
+const minimumDesktopVarianceThreshold = 90
+
+// histogramBinsPerChannel controls the resolution of the per-channel
+// color histogram used as the second gate of the divergence check.
+// 8 bins per channel (×3 = 24 bins) groups 32 consecutive intensity
+// values per bin — coarse enough to be robust to per-pixel noise,
+// fine enough to distinguish a textured wallpaper from a solid black
+// or dark-gray app surface.
+const histogramBinsPerChannel = 8
+
+// histogramSimilarityThreshold is the lower bound on per-channel
+// histogram intersection (sum of min(window_bin, desktop_bin) divided
+// by total pixels, averaged across R/G/B). 0.8 was calibrated so that
+// (a) two crops of the same wallpaper agree well above this bound,
+// (b) a dark app surface vs. a textured wallpaper falls clearly below
+// it, even when the median colors happen to match.
+const histogramSimilarityThreshold = 0.8
 
 // detectGeometryDivergence checks whether the WM-reported client_bounds
 // for `info` actually contains rendered app content or just exposes
-// the root window's wallpaper. Returns a populated *VerbWarning when
-// the patch at the bottom-right interior corner of client_bounds
-// matches the root-window's dominant color above
-// divergenceMatchFraction; returns nil otherwise.
+// the root window's wallpaper. Returns a populated *VerbWarning when:
 //
-// Best-effort heuristic — any X11 sampling failure returns nil so the
-// host verb still reports success. False positives are acceptable;
-// false negatives are acceptable. Cost: one XGetImage for the root
-// reference sample plus one for the client patch.
+//   - A textured (high-variance) desktop reference patch can be located
+//     outside known windows;
+//   - The window patch at the bottom-right interior corner of
+//     client_bounds matches that reference under BOTH the per-channel
+//     color tolerance gate AND the histogram-intersection gate.
+//
+// When no candidate desktop patch exceeds minimumDesktopVarianceThreshold
+// the heuristic is undecidable (solid wallpaper + dark UI is
+// indistinguishable from a stale Gio surface from pixels alone) and
+// the function returns nil. The verb still reports success — the agent
+// should not assume bounds are reliable in that case, but we refuse to
+// false-positive on every dark app.
+//
+// Cost: up to 3 XGetImage calls for desktop candidates + 1 for the
+// window patch. The EstimateRenderedBounds binary search runs only
+// when a warning would actually fire.
 func detectGeometryDivergence(d *x11.Display, info contract.WindowInfo) *VerbWarning {
 	client := info.ClientBounds
 	if client.Empty() {
@@ -48,15 +92,18 @@ func detectGeometryDivergence(d *x11.Display, info contract.WindowInfo) *VerbWar
 		// Patch wouldn't fit; skip rather than oversample a tiny window.
 		return nil
 	}
-	rootColor, ok := dominantRootColor(d)
+	ref, ok := pickDesktopReference(d, info.XID)
 	if !ok {
+		// Undecidable case: no high-variance desktop sample available.
+		// Don't false-positive AND don't false-negative — return nil and
+		// let the agent see "no warning" as "we could not tell."
 		return nil
 	}
 	patch, patchBounds, ok := samplePatchAtCorner(d, client)
 	if !ok {
 		return nil
 	}
-	matches := countColorMatches(patch, rootColor, divergenceMatchTolerance)
+	matches := countColorMatches(patch, ref.median, divergenceMatchTolerance)
 	total := len(patch)
 	if total == 0 {
 		return nil
@@ -65,15 +112,24 @@ func detectGeometryDivergence(d *x11.Display, info contract.WindowInfo) *VerbWar
 	if fraction < divergenceMatchFraction {
 		return nil
 	}
-	estimate := estimateRenderedBounds(d, client, rootColor)
+	histSim := histogramIntersection(patch, ref.histogram, histogramBinsPerChannel)
+	if histSim < histogramSimilarityThreshold {
+		// Color medians agree but value distributions don't — the window
+		// patch is some other dark/solid surface, not the wallpaper.
+		return nil
+	}
+	estimate := estimateRenderedBounds(d, client, ref.median)
 	details := map[string]any{
 		"wm_bounds":                client,
 		"rendered_bounds_estimate": estimate,
 		"probe": map[string]any{
-			"region":         patchBounds,
-			"match_fraction": fraction,
-			"tolerance_px":   divergenceMatchTolerance,
-			"root_color":     formatRGB(rootColor),
+			"region":               patchBounds,
+			"match_fraction":       fraction,
+			"tolerance_px":         divergenceMatchTolerance,
+			"histogram_similarity": histSim,
+			"desktop_reference":    ref.region,
+			"desktop_variance":     ref.variance,
+			"desktop_color":        formatRGB(ref.median),
 		},
 		"suggestion": "app may not be tracking ConfigureNotify; coordinate-based clicks at WM bounds may miss the rendered surface",
 	}
@@ -85,11 +141,12 @@ func detectGeometryDivergence(d *x11.Display, info contract.WindowInfo) *VerbWar
 }
 
 // EstimateRenderedBounds returns a best-effort inner rectangle where
-// the window's rendered surface stops, based on the same patch-vs-root
-// heuristic used by detectGeometryDivergence. Exported so the
-// `windows --detect-rendered` flag can attach a `rendered_bounds_estimate`
-// to each window record. Returns the input bounds (and ok=false) when
-// the heuristic cannot run or no divergence is detected.
+// the window's rendered surface stops, based on the texture-aware
+// patch-vs-desktop heuristic used by detectGeometryDivergence. Exported
+// so the `windows --detect-rendered` flag can attach a
+// `rendered_bounds_estimate` to each window record. Returns the input
+// bounds (and ok=false) when the heuristic cannot run (undecidable
+// desktop, sampling failure) or when no divergence is detected.
 func EstimateRenderedBounds(info contract.WindowInfo) (contract.Bounds, bool) {
 	d, err := x11.Open()
 	if err != nil {
@@ -100,7 +157,7 @@ func EstimateRenderedBounds(info contract.WindowInfo) (contract.Bounds, bool) {
 	if client.Empty() || client.Width < divergenceProbeSize || client.Height < divergenceProbeSize {
 		return client, false
 	}
-	rootColor, ok := dominantRootColor(d)
+	ref, ok := pickDesktopReference(d, info.XID)
 	if !ok {
 		return client, false
 	}
@@ -108,36 +165,300 @@ func EstimateRenderedBounds(info contract.WindowInfo) (contract.Bounds, bool) {
 	if !ok {
 		return client, false
 	}
-	matches := countColorMatches(patch, rootColor, divergenceMatchTolerance)
+	matches := countColorMatches(patch, ref.median, divergenceMatchTolerance)
 	total := len(patch)
 	if total == 0 {
 		return client, false
 	}
 	if float64(matches)/float64(total) < divergenceMatchFraction {
-		// No divergence; rendered bounds == WM client bounds.
 		return client, false
 	}
-	return estimateRenderedBounds(d, client, rootColor), true
+	if histogramIntersection(patch, ref.histogram, histogramBinsPerChannel) < histogramSimilarityThreshold {
+		return client, false
+	}
+	return estimateRenderedBounds(d, client, ref.median), true
 }
 
-// dominantRootColor samples a small patch of exposed desktop one
-// divergenceProbeSize step to the left and above client_bounds-origin
-// is too risky because some WMs paint there. Instead we sample the
-// top-left corner of the root window — coordinate (0,0) — which is
-// reliably wallpaper on every WM that doesn't have a desktop manager
-// drawing widgets at the screen origin. Returns the median color of
-// the sampled patch so the dominant background dominates even when
-// the wallpaper has subtle gradients.
-func dominantRootColor(d *x11.Display) (color.RGBA, bool) {
-	// Sample at the screen origin first; if the patch shows an obvious
-	// non-uniform region (e.g., a desktop widget) fall back to the
-	// bottom-right corner of the root window.
+// desktopReference bundles the result of pickDesktopReference: the
+// region we sampled, its median color, its per-channel variance sum,
+// and its color histogram. detectGeometryDivergence uses median for
+// the color-tolerance gate and histogram for the distribution gate;
+// estimateRenderedBounds uses just the median when binary-searching
+// the rendered edge.
+type desktopReference struct {
+	region    contract.Bounds
+	median    color.RGBA
+	variance  int
+	histogram [histogramBinsPerChannel * 3]int
+}
+
+// pickDesktopReference samples up to three candidate desktop patches at
+// locations that are usually exposed wallpaper (bottom and right
+// screen edges, well away from origin so a Gio surface stuck at
+// top-left can't bleed into the sample). Candidates that intersect any
+// known window's bounds are dropped. Of the surviving candidates,
+// the one with the highest combined-channel variance is returned —
+// PROVIDED that variance exceeds minimumDesktopVarianceThreshold. A
+// "winning" patch with insufficient variance means the wallpaper is
+// effectively solid color and the divergence heuristic cannot
+// distinguish it from a dark app surface; in that case ok=false and
+// the caller aborts.
+//
+// excludeXID is the XID of the window currently being checked; its
+// bounds are not used to filter candidates (the function is about to
+// sample inside its client_bounds anyway), but other visible windows
+// ARE used. When the window list cannot be enumerated (no atoms, X11
+// error) the function proceeds without the filter and relies on the
+// variance gate to reject candidates that landed inside an app
+// surface.
+func pickDesktopReference(d *x11.Display, excludeXID uint32) (desktopReference, bool) {
 	screen := x11.ScreenBounds(d)
-	patch, _, ok := samplePatch(d, contract.Bounds{X: 0, Y: 0, Width: divergenceProbeSize, Height: divergenceProbeSize}, screen)
-	if !ok || len(patch) == 0 {
-		return color.RGBA{}, false
+	if screen.Width < divergenceProbeSize*2 || screen.Height < divergenceProbeSize*2 {
+		// Screen too small to host any candidate that wouldn't overlap a
+		// fullscreen app — bail out.
+		return desktopReference{}, false
 	}
-	return medianColor(patch), true
+	// Three candidate locations chosen on the bottom and right screen
+	// edges, far from the screen origin (so a Gio surface stuck at
+	// (0,0) cannot poison every sample). Each rectangle is clamped to
+	// the screen by samplePatch().
+	margin := divergenceProbeSize / 5 // small inset off the absolute edge
+	candidates := []contract.Bounds{
+		{
+			X:      screen.Width/2 - divergenceProbeSize/2,
+			Y:      screen.Height - divergenceProbeSize - margin,
+			Width:  divergenceProbeSize,
+			Height: divergenceProbeSize,
+		},
+		{
+			X:      screen.Width - divergenceProbeSize - margin,
+			Y:      screen.Height/2 - divergenceProbeSize/2,
+			Width:  divergenceProbeSize,
+			Height: divergenceProbeSize,
+		},
+		{
+			X:      screen.Width / 4,
+			Y:      screen.Height - divergenceProbeSize - margin,
+			Width:  divergenceProbeSize,
+			Height: divergenceProbeSize,
+		},
+	}
+	// Best-effort exclusion of candidates that lie inside any other
+	// visible window. Failure to enumerate is non-fatal; variance gate
+	// is the backstop.
+	occupied := otherWindowBounds(d, excludeXID)
+	var best *desktopReference
+	for _, region := range candidates {
+		if intersectsAny(region, occupied) {
+			continue
+		}
+		patch, clamped, ok := samplePatch(d, region, screen)
+		if !ok || len(patch) == 0 {
+			continue
+		}
+		variance := combinedChannelVariance(patch)
+		if variance < minimumDesktopVarianceThreshold {
+			continue
+		}
+		if best == nil || variance > best.variance {
+			candidate := desktopReference{
+				region:    clamped,
+				median:    medianColor(patch),
+				variance:  variance,
+				histogram: colorHistogram(patch, histogramBinsPerChannel),
+			}
+			best = &candidate
+		}
+	}
+	if best == nil {
+		return desktopReference{}, false
+	}
+	return *best, true
+}
+
+// otherWindowBounds enumerates visible top-level windows via
+// _NET_CLIENT_LIST and returns their outer Bounds (decoration-included
+// rectangles) so pickDesktopReference can skip candidate patches that
+// would land inside an app surface. excludeXID is filtered out so a
+// fullscreen-but-stuck window doesn't make every candidate look
+// occupied. Iconified (minimized) windows are also dropped — they sit
+// in _NET_CLIENT_LIST but their geometry no longer reflects something
+// the user can see, so excluding their bounds prevents a minimized
+// fullscreen app (e.g., parsecd in the system tray) from blocking
+// every candidate. Errors are non-fatal — the function returns
+// whatever it could read, and a nil slice if it could read nothing.
+func otherWindowBounds(d *x11.Display, excludeXID uint32) []contract.Bounds {
+	atomMap, err := atoms(d.Conn)
+	if err != nil {
+		return nil
+	}
+	ids, err := clientList(d.Conn, d.Screen.Root, atomMap)
+	if err != nil {
+		return nil
+	}
+	out := make([]contract.Bounds, 0, len(ids))
+	for _, id := range ids {
+		if uint32(id) == excludeXID {
+			continue
+		}
+		if !isWindowVisible(d, id) {
+			continue
+		}
+		info, err := infoFor(d.Conn, d.Screen.Root, id, atomMap, 0)
+		if err != nil {
+			continue
+		}
+		if info.Bounds.Empty() {
+			continue
+		}
+		out = append(out, info.Bounds)
+	}
+	return out
+}
+
+// isWindowVisible reports whether `id` is currently in NormalState per
+// ICCCM 4.1.4 (WM_STATE). Iconified and withdrawn windows return
+// false; windows that lack the property (some override-redirect
+// surfaces) default to true so we err on the side of filtering
+// candidates that might overlap real UI. Any X11 error falls back to
+// true for the same reason.
+func isWindowVisible(d *x11.Display, id xproto.Window) bool {
+	wmState, err := x11.InternAtom(d.Conn, "WM_STATE")
+	if err != nil {
+		return true
+	}
+	reply, err := xproto.GetProperty(d.Conn, false, id, wmState, wmState, 0, 2).Reply()
+	if err != nil || len(reply.Value) < 4 {
+		return true
+	}
+	// ICCCM WM_STATE layout: state CARD32 (offset 0), icon WINDOW (offset 4).
+	// state: 0=Withdrawn, 1=Normal, 3=Iconic.
+	state := uint32(reply.Value[0]) | uint32(reply.Value[1])<<8 | uint32(reply.Value[2])<<16 | uint32(reply.Value[3])<<24
+	return state == 1
+}
+
+// intersectsAny reports whether `region` overlaps any rectangle in
+// `others`.
+func intersectsAny(region contract.Bounds, others []contract.Bounds) bool {
+	for _, o := range others {
+		if rectsIntersect(region, o) {
+			return true
+		}
+	}
+	return false
+}
+
+// rectsIntersect is the standard AABB overlap test.
+func rectsIntersect(a, b contract.Bounds) bool {
+	if a.Empty() || b.Empty() {
+		return false
+	}
+	return a.X < b.X+b.Width &&
+		b.X < a.X+a.Width &&
+		a.Y < b.Y+b.Height &&
+		b.Y < a.Y+a.Height
+}
+
+// combinedChannelVariance returns the sum of per-channel variances
+// across R, G, B in the supplied patch. Variance is computed as the
+// population variance E[(X-μ)²]. Higher values indicate more textured
+// content (gradient, photo, noise); near-zero values indicate a solid
+// or near-solid color. See minimumDesktopVarianceThreshold for the
+// calibration rationale.
+func combinedChannelVariance(pixels []color.RGBA) int {
+	n := len(pixels)
+	if n == 0 {
+		return 0
+	}
+	var sumR, sumG, sumB int
+	for _, p := range pixels {
+		sumR += int(p.R)
+		sumG += int(p.G)
+		sumB += int(p.B)
+	}
+	meanR := sumR / n
+	meanG := sumG / n
+	meanB := sumB / n
+	var varR, varG, varB int
+	for _, p := range pixels {
+		dr := int(p.R) - meanR
+		dg := int(p.G) - meanG
+		db := int(p.B) - meanB
+		varR += dr * dr
+		varG += dg * dg
+		varB += db * db
+	}
+	return (varR + varG + varB) / n
+}
+
+// colorHistogram returns a flat per-channel histogram for the supplied
+// patch: bins for R first, then G, then B, each of length bins. With
+// bins=8, the 24-element slice splits the [0,255] range into 32-wide
+// buckets per channel.
+func colorHistogram(pixels []color.RGBA, bins int) [histogramBinsPerChannel * 3]int {
+	var hist [histogramBinsPerChannel * 3]int
+	if bins != histogramBinsPerChannel {
+		// Defensive: the public API takes a parameter but the array size
+		// is fixed by the package-level constant. Callers always pass
+		// histogramBinsPerChannel; this branch keeps the function honest.
+		return hist
+	}
+	binWidth := 256 / bins
+	if binWidth <= 0 {
+		binWidth = 1
+	}
+	for _, p := range pixels {
+		ri := int(p.R) / binWidth
+		gi := int(p.G) / binWidth
+		bi := int(p.B) / binWidth
+		if ri >= bins {
+			ri = bins - 1
+		}
+		if gi >= bins {
+			gi = bins - 1
+		}
+		if bi >= bins {
+			bi = bins - 1
+		}
+		hist[ri]++
+		hist[bins+gi]++
+		hist[2*bins+bi]++
+	}
+	return hist
+}
+
+// histogramIntersection compares the histogram of `patch` against a
+// reference histogram and returns a similarity score in [0, 1] where
+// 1 means identical distributions and 0 means disjoint. The score is
+// computed per channel as sum(min(patch_bin, ref_bin))/total_pixels
+// and averaged across R, G, B. This metric is well-behaved when the
+// two patches have the same number of pixels (which they do — both are
+// divergenceProbeSize × divergenceProbeSize).
+func histogramIntersection(patch []color.RGBA, ref [histogramBinsPerChannel * 3]int, bins int) float64 {
+	if len(patch) == 0 || bins != histogramBinsPerChannel {
+		return 0
+	}
+	patchHist := colorHistogram(patch, bins)
+	total := len(patch)
+	if total == 0 {
+		return 0
+	}
+	var sims [3]float64
+	for c := 0; c < 3; c++ {
+		offset := c * bins
+		var inter int
+		for i := 0; i < bins; i++ {
+			a := patchHist[offset+i]
+			b := ref[offset+i]
+			if a < b {
+				inter += a
+			} else {
+				inter += b
+			}
+		}
+		sims[c] = float64(inter) / float64(total)
+	}
+	return (sims[0] + sims[1] + sims[2]) / 3.0
 }
 
 // samplePatchAtCorner samples a divergenceProbeSize patch anchored to
@@ -332,24 +653,24 @@ func absDiff(a, b int) int {
 }
 
 // estimateRenderedBounds searches for the rectangle inside client_bounds
-// whose bottom-right corner stops matching the root color, giving the
-// agent a usable hint about the actual rendered surface size. Uses a
-// binary search along each axis independently (independent searches
-// keep total cost at O(log N) XGetImage calls per axis rather than the
-// O(N²) full grid that a true 2D search would need).
+// whose bottom-right corner stops matching the desktop reference color,
+// giving the agent a usable hint about the actual rendered surface
+// size. Uses a binary search along each axis independently (independent
+// searches keep total cost at O(log N) XGetImage calls per axis rather
+// than the O(N²) full grid that a true 2D search would need).
 //
 // The estimate snaps to multiples of divergenceProbeSize since that is
 // the sampling resolution. Returns the original client_bounds when the
 // search cannot narrow the rectangle (e.g., even a single-step shrink
-// still matches the root color — likely a window with NO rendered
+// still matches the desktop color — likely a window with NO rendered
 // surface at all).
-func estimateRenderedBounds(d *x11.Display, client contract.Bounds, rootColor color.RGBA) contract.Bounds {
+func estimateRenderedBounds(d *x11.Display, client contract.Bounds, desktopColor color.RGBA) contract.Bounds {
 	step := divergenceProbeSize
 	rendered := client
 	screen := x11.ScreenBounds(d)
 	// Shrink width: find the largest w such that the patch at the inner
 	// bottom-right corner of a rectangle (origin, w, client.Height)
-	// stops matching the root color.
+	// stops matching the desktop reference color.
 	if client.Width > step {
 		lo, hi := step, client.Width
 		// First confirm the corner at full width matches (it must, since
@@ -367,7 +688,7 @@ func estimateRenderedBounds(d *x11.Display, client contract.Bounds, rootColor co
 			if !ok {
 				break
 			}
-			matches := countColorMatches(patch, rootColor, divergenceMatchTolerance)
+			matches := countColorMatches(patch, desktopColor, divergenceMatchTolerance)
 			fraction := float64(matches) / float64(len(patch))
 			if fraction >= divergenceMatchFraction {
 				// Inside the exposed-desktop band; rendered surface is
@@ -398,7 +719,7 @@ func estimateRenderedBounds(d *x11.Display, client contract.Bounds, rootColor co
 			if !ok {
 				break
 			}
-			matches := countColorMatches(patch, rootColor, divergenceMatchTolerance)
+			matches := countColorMatches(patch, desktopColor, divergenceMatchTolerance)
 			fraction := float64(matches) / float64(len(patch))
 			if fraction >= divergenceMatchFraction {
 				hi = mid - 1
