@@ -14,6 +14,64 @@ in `anvil.md` for the rule.
 
 ## [Unreleased]
 
+## [0.3.1] — 2026-05-26
+
+Codex-dogfood patch. An external agent (Codex) loaded the skill via
+`npx skills add 1broseidon/mc` and used it for a real visual-QA pass of
+a Gio app, surfacing three friction points. v0.3.1 closes all three.
+
+### Added
+
+- `mycomputer serve --display :N` — explicit `DISPLAY` override for
+  MCP hosts launched from non-X-aware parents (`.desktop` launchers,
+  systemd user units, IDE integrated terminals). (task-28)
+- DISPLAY env auto-probe — when `DISPLAY` is unset, the doctor scans
+  `/tmp/.X11-unix/` for active X server sockets and auto-sets the
+  in-process env when exactly one is live. Doctor row reports
+  `auto-detected :N from /tmp/.X11-unix/X<N>`. Ambiguous (multiple
+  live servers) and missing cases produce structured remediation
+  hints. The parent shell's env is never mutated. (task-28)
+- `WINDOW_GEOMETRY_DIVERGED` warning — emitted as an advisory on
+  `window_move` / `window_resize` / `window_maximize` when the
+  WM-reported `client_bounds` disagrees with the actual rendered
+  surface (typical of immediate-mode toolkits — Gio, Dear ImGui,
+  Flutter-Linux, egui — that don't react to `ConfigureNotify`).
+  Action still `ok:true`; agents should fall back to `find_*` instead
+  of trusting WM bounds when this fires. (task-29)
+- `mycomputer windows --detect-rendered` flag — adds
+  `rendered_bounds_estimate` per window via binary-search sampling.
+  Off by default (one extra `XGetImage` per window when enabled).
+  (task-29)
+- `find_text` smart PSM auto-retry — when the caller passes default
+  `psm=0`, the first OCR pass returns zero candidates, and the
+  region area is below `smartPSMRegionThresholdPx` (100,000 px²),
+  `find_text` automatically retries once with `psm=11` (sparse text).
+  Candidates surface `psm_retried: true` and `psm_used: 11` in
+  `extra`. Behavior is bit-for-bit identical for callers that pass
+  an explicit non-zero `psm`. (task-30)
+- "When OCR fails" recovery decision tree in
+  `skill/references/cli-recipes.md` and a worked `find_text` →
+  `find_color` escalation example in `skill/references/desktop-workflows.md`
+  with real hex colors from Familiar and gnome-calculator. (task-30)
+
+### Documentation
+
+- `skill/SKILL.md` "MCP host DISPLAY" subsection — explains the
+  env-inheritance issue, the auto-probe behavior, and the
+  `--display` override, with a JSON config example for MCP hosts.
+  (task-28)
+- `skill/references/desktop-workflows.md` "Recovery — WM bounds vs
+  rendered surface" subsection under Drive-a-Gio-app — how to
+  detect and recover from the divergence using `find_color` /
+  `find_text`. (task-29)
+
+### Schema versions
+
+- `schema_version` remains `"0.2"`. Supported list:
+  `["0.2", "0.1"]`. No wire-shape mutations in v0.3.1; all changes
+  are additive (new flags, new warnings, new `extra` fields, new
+  doctor row formats).
+
 ## [0.3.0] — 2026-05-26
 
 The v0.3 polish release. Locks the public surface (CLI, MCP tools,
