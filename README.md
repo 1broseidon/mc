@@ -20,7 +20,7 @@ Use it when you need:
 One-line install (downloads the latest release into `~/.local/bin`):
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/1broseidon/mc/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/1broseidon/mc/main/install.sh | bash
 ```
 
 Inspect first, then run:
@@ -28,14 +28,14 @@ Inspect first, then run:
 ```sh
 curl -fsSL https://raw.githubusercontent.com/1broseidon/mc/main/install.sh -o install.sh
 less install.sh
-sh install.sh
+bash install.sh
 ```
 
 Environment overrides:
 
 ```sh
-VERSION=v0.3.0 sh install.sh                     # pin a specific tag
-BIN_DIR=/usr/local/bin sudo sh install.sh        # system-wide install
+VERSION=v0.3.0 bash install.sh                     # pin a specific tag
+BIN_DIR=/usr/local/bin sudo bash install.sh        # system-wide install
 ```
 
 Or with Go:

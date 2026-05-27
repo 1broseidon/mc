@@ -2,7 +2,7 @@
 # install.sh — fetch a released mycomputer binary into a user bin directory.
 #
 # Usage:
-#   curl -fsSL https://raw.githubusercontent.com/1broseidon/mc/main/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/1broseidon/mc/main/install.sh | bash
 #
 # Environment overrides:
 #   VERSION   Release tag to install (e.g. v0.3.0). Defaults to the latest GitHub release.

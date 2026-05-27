@@ -95,7 +95,7 @@ If detection fails on both paths, offer to install. The canonical Linux
 installer:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/1broseidon/mc/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/1broseidon/mc/main/install.sh | bash
 ```
 
 Default install location is `~/.local/bin/mycomputer` (no sudo). After install:
@@ -109,7 +109,7 @@ Default install location is `~/.local/bin/mycomputer` (no sudo). After install:
 ```bash
 curl -fsSL https://raw.githubusercontent.com/1broseidon/mc/main/install.sh -o /tmp/mc-install.sh
 less /tmp/mc-install.sh
-sh /tmp/mc-install.sh
+bash /tmp/mc-install.sh
 ```
 
 **Environment overrides:**

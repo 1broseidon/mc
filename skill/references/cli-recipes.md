@@ -11,11 +11,11 @@ which mycomputer
 mycomputer doctor --json | jq '.readiness.status'
 
 # Install (Linux user bin, default ~/.local/bin):
-curl -fsSL https://raw.githubusercontent.com/1broseidon/mc/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/1broseidon/mc/main/install.sh | bash
 
 # Pin a version or change the install dir:
-VERSION=v0.3.0 sh install.sh
-BIN_DIR=/usr/local/bin sudo sh install.sh
+VERSION=v0.3.0 bash install.sh
+BIN_DIR=/usr/local/bin sudo bash install.sh
 
 # Go install:
 go install github.com/1broseidon/mc/cmd/mycomputer@latest
