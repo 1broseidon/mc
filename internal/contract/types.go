@@ -220,6 +220,16 @@ type RegionRef struct {
 	Space        string       `json:"space,omitempty" jsonschema:"screen (default), window, window_frame, or monitor"`
 	Target       WindowTarget `json:"target,omitzero" jsonschema:"window selector; required when space=window or window_frame"`
 	MonitorIndex *int         `json:"monitor_index,omitempty" jsonschema:"zero-based monitor index; required when space=monitor"`
+	// Strict makes ResolveRegion fail-loudly with REGION_OUT_OF_BOUNDS
+	// when the requested rectangle exceeds the resolved-space bounds
+	// (window client_bounds, monitor bounds, or screen bounds). The
+	// default (Strict=false) clamps to the available area and surfaces
+	// the change via the resolve result's Clamped flag so the screenshot
+	// / find_* / wait_for_* response can report region_clamped:true plus
+	// the original and clamped local rectangles. Opt-in for callers that
+	// want a hard validation error on oversized regions instead of a
+	// silent clamp.
+	Strict bool `json:"strict,omitempty" jsonschema:"fail with REGION_OUT_OF_BOUNDS when the region exceeds the resolved-space bounds; default false clamps to the available area and reports region_clamped:true"`
 }
 
 // Empty reports whether the RegionRef carries no usable size. Width or
@@ -245,11 +255,43 @@ func RegionRefFromBounds(b Bounds) RegionRef {
 	return RegionRef{X: b.X, Y: b.Y, Width: b.Width, Height: b.Height}
 }
 
+// ResolveResult is the detailed return value of ResolveRegionDetailed.
+// Bounds is the absolute screen-space rectangle suitable for XGetImage.
+// When Clamped is true the requested rectangle exceeded the
+// resolved-space bounds (window client_bounds, monitor bounds, or
+// screen bounds) and was silently shrunk to fit; OriginalRegion records
+// the originally-requested local rectangle and ClampedRegion records
+// the local rectangle that was actually used. Both are in the local
+// (pre-resolution) coordinate space — same shape as RegionRef.Bounds().
+//
+// Callers that surface the clamp to the agent (screenshot, find_*,
+// wait_for_*) should attach OriginalRegion and ClampedRegion under
+// details.original_region and details.clamped_region next to the
+// region_clamped:true flag so the agent sees the silent fix.
+type ResolveResult struct {
+	// Bounds is the absolute screen-space rectangle.
+	Bounds Bounds
+	// Clamped reports whether ResolveRegionDetailed shrunk the requested
+	// rectangle to fit the resolved-space bounds. Always false when
+	// Strict was set on the request (Strict callers receive
+	// REGION_OUT_OF_BOUNDS instead of a clamp).
+	Clamped bool
+	// OriginalRegion is the local (pre-resolution) rectangle the caller
+	// asked for. Set when Clamped is true; zero-value otherwise.
+	OriginalRegion Bounds
+	// ClampedRegion is the local (pre-resolution) rectangle actually
+	// used after the clamp. Set when Clamped is true; zero-value
+	// otherwise.
+	ClampedRegion Bounds
+}
+
 // ResolveRegion is the single internal entry point that converts a
 // RegionRef in any declared coordinate space into an absolute
-// screen-space Bounds. Mirrors Resolve() for Points.
+// screen-space Bounds. Mirrors Resolve() for Points. Wrapper around
+// ResolveRegionDetailed for callers that do not need the clamp
+// metadata.
 //
-// Behavior:
+// Behavior summary (see ResolveRegionDetailed for the full contract):
 //
 //   - Space "" or "screen": returns the bare Bounds unchanged.
 //   - Space "window": requires Target and a non-empty
@@ -262,25 +304,64 @@ func RegionRefFromBounds(b Bounds) RegionRef {
 //     ResolveContext.Monitors. Rectangle is interpreted relative to
 //     that monitor's bounds.
 //
-// The returned Bounds is the *requested* rectangle in absolute screen
-// coordinates. Callers (screen.Capture, screen.CaptureRGBA) are still
-// responsible for clamping to the screen bounds — ResolveRegion does
-// not silently truncate. Any unknown space is a hard validation error.
+// Oversized regions are CLAMPED to the resolved-space bounds by
+// default; set RegionRef.Strict=true to receive REGION_OUT_OF_BOUNDS
+// instead. The returned Bounds is the *effective* rectangle (post-clamp
+// in non-strict mode) in absolute screen coordinates.
 //
-// A zero-sized RegionRef (Empty() == true) is returned as a zero-sized
-// Bounds with the resolved origin so callers can apply their own
-// "empty means default" fallback (e.g. focused-window region).
+// A zero-sized RegionRef (Empty() == true) is returned as the full
+// resolved-space rectangle so callers can use it as a "default to this
+// window/monitor" shorthand. Any unknown space is a hard validation
+// error. Any required-field validation (REGION_TARGET_REQUIRED,
+// REGION_MONITOR_INDEX_REQUIRED) is also a hard validation error
+// regardless of Strict.
 func ResolveRegion(r RegionRef, rctx ResolveContext) (Bounds, error) {
+	res, err := ResolveRegionDetailed(r, rctx)
+	if err != nil {
+		return Bounds{}, err
+	}
+	return res.Bounds, nil
+}
+
+// ResolveRegionDetailed converts a RegionRef in any declared coordinate
+// space into a ResolveResult carrying the absolute screen-space bounds
+// plus optional clamp metadata. This is the single entry point that
+// every region-aware consumer (screen.Capture, find_text, find_image,
+// find_color, wait_for_pixel_change, wait_for_text) should use; the
+// older ResolveRegion is a thin wrapper that discards the clamp
+// metadata for callers that do not surface it.
+//
+// Clamp policy (v0.3.4):
+//
+//   - When RegionRef.Strict is false (the default), an oversized request
+//     (negative offset OR offset+extent past the resolved-space bounds)
+//     is clamped to the available area. The result reports Clamped=true,
+//     OriginalRegion (local rect requested), and ClampedRegion (local
+//     rect after clamp). Surface these to the agent under
+//     details.region_clamped / details.original_region /
+//     details.clamped_region.
+//
+//   - When RegionRef.Strict is true, the same condition returns
+//     REGION_OUT_OF_BOUNDS as before — preserves the fail-loudly path
+//     for callers that prefer it.
+//
+// Required-field validation (REGION_TARGET_REQUIRED,
+// REGION_MONITOR_INDEX_REQUIRED), missing-target precondition
+// (WINDOW_NOT_FOUND, WINDOW_AMBIGUOUS), unknown-bounds
+// (WINDOW_BOUNDS_UNKNOWN, MONITOR_BOUNDS_UNKNOWN), and bad-space
+// validation (INVALID_COORDINATE_SPACE) are always hard errors
+// regardless of Strict.
+func ResolveRegionDetailed(r RegionRef, rctx ResolveContext) (ResolveResult, error) {
 	switch r.Space {
 	case "", CoordSpaceScreen:
-		return r.Bounds(), nil
+		return ResolveResult{Bounds: r.Bounds()}, nil
 	case CoordSpaceWindow, CoordSpaceWindowFrame:
 		if r.Target.Empty() {
-			return Bounds{}, Validation("REGION_TARGET_REQUIRED", "window-space region requires a target (id, title, class, or pid)", map[string]any{"space": r.Space})
+			return ResolveResult{}, Validation("REGION_TARGET_REQUIRED", "window-space region requires a target (id, title, class, or pid)", map[string]any{"space": r.Space})
 		}
 		win, err := matchWindow(rctx.Windows, r.Target)
 		if err != nil {
-			return Bounds{}, err
+			return ResolveResult{}, err
 		}
 		origin := win.Bounds
 		if r.Space == CoordSpaceWindow {
@@ -289,53 +370,118 @@ func ResolveRegion(r RegionRef, rctx ResolveContext) (Bounds, error) {
 			}
 		}
 		if origin.Empty() {
-			return Bounds{}, Validation("WINDOW_BOUNDS_UNKNOWN", "matched window has no usable bounds", map[string]any{"target": r.Target, "window_id": win.ID})
+			return ResolveResult{}, Validation("WINDOW_BOUNDS_UNKNOWN", "matched window has no usable bounds", map[string]any{"target": r.Target, "window_id": win.ID})
 		}
 		if r.Width <= 0 || r.Height <= 0 {
 			// Zero-sized region in window space: return the full window
 			// rect so callers can use it as a "default to this window"
 			// shorthand.
-			return origin, nil
+			return ResolveResult{Bounds: origin}, nil
 		}
-		if r.X < 0 || r.Y < 0 || r.X+r.Width > origin.Width || r.Y+r.Height > origin.Height {
-			return Bounds{}, Validation("REGION_OUT_OF_BOUNDS", "window-space region is outside the window bounds", map[string]any{
-				"space":     r.Space,
-				"region":    r.Bounds(),
-				"window_id": win.ID,
-				"bounds":    origin,
-			})
+		outOfBounds := r.X < 0 || r.Y < 0 || r.X+r.Width > origin.Width || r.Y+r.Height > origin.Height
+		if outOfBounds {
+			if r.Strict {
+				return ResolveResult{}, Validation("REGION_OUT_OF_BOUNDS", "window-space region is outside the window bounds", map[string]any{
+					"space":     r.Space,
+					"region":    r.Bounds(),
+					"window_id": win.ID,
+					"bounds":    origin,
+				})
+			}
+			clamped := clampLocal(r.Bounds(), origin.Width, origin.Height)
+			if clamped.Empty() {
+				return ResolveResult{}, Validation("REGION_OUT_OF_BOUNDS", "window-space region is entirely outside the window bounds", map[string]any{
+					"space":     r.Space,
+					"region":    r.Bounds(),
+					"window_id": win.ID,
+					"bounds":    origin,
+				})
+			}
+			return ResolveResult{
+				Bounds:         Bounds{X: origin.X + clamped.X, Y: origin.Y + clamped.Y, Width: clamped.Width, Height: clamped.Height},
+				Clamped:        true,
+				OriginalRegion: r.Bounds(),
+				ClampedRegion:  clamped,
+			}, nil
 		}
-		return Bounds{X: origin.X + r.X, Y: origin.Y + r.Y, Width: r.Width, Height: r.Height}, nil
+		return ResolveResult{Bounds: Bounds{X: origin.X + r.X, Y: origin.Y + r.Y, Width: r.Width, Height: r.Height}}, nil
 	case CoordSpaceMonitor:
 		if r.MonitorIndex == nil {
-			return Bounds{}, Validation("REGION_MONITOR_INDEX_REQUIRED", "monitor-space region requires a monitor_index", map[string]any{"space": r.Space})
+			return ResolveResult{}, Validation("REGION_MONITOR_INDEX_REQUIRED", "monitor-space region requires a monitor_index", map[string]any{"space": r.Space})
 		}
 		idx := *r.MonitorIndex
 		if idx < 0 || idx >= len(rctx.Monitors) {
-			return Bounds{}, Validation("MONITOR_INDEX_OUT_OF_RANGE", "monitor_index is outside the available monitors", map[string]any{
+			return ResolveResult{}, Validation("MONITOR_INDEX_OUT_OF_RANGE", "monitor_index is outside the available monitors", map[string]any{
 				"monitor_index": idx,
 				"monitor_count": len(rctx.Monitors),
 			})
 		}
 		bounds := rctx.Monitors[idx].Bounds
 		if bounds.Empty() {
-			return Bounds{}, Validation("MONITOR_BOUNDS_UNKNOWN", "selected monitor has no usable bounds", map[string]any{"monitor_index": idx})
+			return ResolveResult{}, Validation("MONITOR_BOUNDS_UNKNOWN", "selected monitor has no usable bounds", map[string]any{"monitor_index": idx})
 		}
 		if r.Width <= 0 || r.Height <= 0 {
-			return bounds, nil
+			return ResolveResult{Bounds: bounds}, nil
 		}
-		if r.X < 0 || r.Y < 0 || r.X+r.Width > bounds.Width || r.Y+r.Height > bounds.Height {
-			return Bounds{}, Validation("REGION_OUT_OF_BOUNDS", "monitor-space region is outside the monitor bounds", map[string]any{
-				"space":         r.Space,
-				"region":        r.Bounds(),
-				"monitor_index": idx,
-				"bounds":        bounds,
-			})
+		outOfBounds := r.X < 0 || r.Y < 0 || r.X+r.Width > bounds.Width || r.Y+r.Height > bounds.Height
+		if outOfBounds {
+			if r.Strict {
+				return ResolveResult{}, Validation("REGION_OUT_OF_BOUNDS", "monitor-space region is outside the monitor bounds", map[string]any{
+					"space":         r.Space,
+					"region":        r.Bounds(),
+					"monitor_index": idx,
+					"bounds":        bounds,
+				})
+			}
+			clamped := clampLocal(r.Bounds(), bounds.Width, bounds.Height)
+			if clamped.Empty() {
+				return ResolveResult{}, Validation("REGION_OUT_OF_BOUNDS", "monitor-space region is entirely outside the monitor bounds", map[string]any{
+					"space":         r.Space,
+					"region":        r.Bounds(),
+					"monitor_index": idx,
+					"bounds":        bounds,
+				})
+			}
+			return ResolveResult{
+				Bounds:         Bounds{X: bounds.X + clamped.X, Y: bounds.Y + clamped.Y, Width: clamped.Width, Height: clamped.Height},
+				Clamped:        true,
+				OriginalRegion: r.Bounds(),
+				ClampedRegion:  clamped,
+			}, nil
 		}
-		return Bounds{X: bounds.X + r.X, Y: bounds.Y + r.Y, Width: r.Width, Height: r.Height}, nil
+		return ResolveResult{Bounds: Bounds{X: bounds.X + r.X, Y: bounds.Y + r.Y, Width: r.Width, Height: r.Height}}, nil
 	default:
-		return Bounds{}, Validation("INVALID_COORDINATE_SPACE", "region coordinate space must be screen, window, window_frame, or monitor", map[string]any{"space": r.Space})
+		return ResolveResult{}, Validation("INVALID_COORDINATE_SPACE", "region coordinate space must be screen, window, window_frame, or monitor", map[string]any{"space": r.Space})
 	}
+}
+
+// clampLocal shrinks a local-space rectangle (relative to a window or
+// monitor origin) to fit within [0, width) x [0, height). Returns an
+// empty Bounds when the requested rect lies entirely outside the
+// available area — callers should treat that as an unrecoverable
+// REGION_OUT_OF_BOUNDS regardless of Strict, because there is no
+// non-empty sub-rectangle to clamp to.
+func clampLocal(r Bounds, width, height int) Bounds {
+	x1 := r.X
+	if x1 < 0 {
+		x1 = 0
+	}
+	y1 := r.Y
+	if y1 < 0 {
+		y1 = 0
+	}
+	x2 := r.X + r.Width
+	if x2 > width {
+		x2 = width
+	}
+	y2 := r.Y + r.Height
+	if y2 > height {
+		y2 = height
+	}
+	if x2 <= x1 || y2 <= y1 {
+		return Bounds{}
+	}
+	return Bounds{X: x1, Y: y1, Width: x2 - x1, Height: y2 - y1}
 }
 
 type Size struct {
@@ -794,6 +940,21 @@ type ScreenshotResult struct {
 	ImageSize     Size   `json:"image_size"`
 	CoordMap      string `json:"coord_map"`
 	Backend       string `json:"backend"`
+	// RegionClamped reports that the request asked for a region larger
+	// than the resolved-space bounds (window client_bounds, monitor
+	// bounds, or screen bounds) and the capture was silently shrunk to
+	// fit. Field is omitted when no clamp occurred so existing
+	// in-bounds calls return the same wire shape as before.
+	RegionClamped bool `json:"region_clamped,omitempty"`
+	// OriginalRegion is the local (pre-resolution) rectangle the caller
+	// requested. Present only when RegionClamped is true. For window-
+	// and monitor-space requests this is the rectangle relative to the
+	// window or monitor origin; for screen-space requests it equals
+	// the original {x,y,width,height} from the request.
+	OriginalRegion *Bounds `json:"original_region,omitempty"`
+	// ClampedRegion is the local (pre-resolution) rectangle actually
+	// used after the clamp. Present only when RegionClamped is true.
+	ClampedRegion *Bounds `json:"clamped_region,omitempty"`
 }
 
 type ObserveResult struct {
@@ -854,4 +1015,15 @@ type FindResult struct {
 	Candidates   []FindCandidate `json:"candidates"`
 	SearchRegion Bounds          `json:"search_region"`
 	CoordSpace   string          `json:"coord_space" jsonschema:"always screen for find results"`
+	// RegionClamped reports that the request asked for a search region
+	// larger than the resolved-space bounds and the find primitive
+	// silently shrunk it to fit. Omitted when no clamp occurred so
+	// existing in-bounds calls return the same wire shape.
+	RegionClamped bool `json:"region_clamped,omitempty"`
+	// OriginalRegion is the local (pre-resolution) rectangle the caller
+	// requested. Present only when RegionClamped is true.
+	OriginalRegion *Bounds `json:"original_region,omitempty"`
+	// ClampedRegion is the local (pre-resolution) rectangle actually
+	// searched after the clamp. Present only when RegionClamped is true.
+	ClampedRegion *Bounds `json:"clamped_region,omitempty"`
 }

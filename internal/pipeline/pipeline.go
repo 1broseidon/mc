@@ -802,7 +802,17 @@ func dispatchAction(ctx context.Context, batch ActionBatch, action Action, idx i
 			return rec, contract.ActionResult{}, err
 		}
 		out.Screenshot = &shot
-		return rec, contract.ActionResult{Action: action.Type, OK: true, Backend: shot.Backend, Details: map[string]any{"screenshot": shot}}, nil
+		details := map[string]any{"screenshot": shot}
+		if shot.RegionClamped {
+			details["region_clamped"] = true
+			if shot.OriginalRegion != nil {
+				details["original_region"] = *shot.OriginalRegion
+			}
+			if shot.ClampedRegion != nil {
+				details["clamped_region"] = *shot.ClampedRegion
+			}
+		}
+		return rec, contract.ActionResult{Action: action.Type, OK: true, Backend: shot.Backend, Details: details}, nil
 	case "observe":
 		obs, err := Observe(ctx, false)
 		if err != nil {
@@ -816,21 +826,21 @@ func dispatchAction(ctx context.Context, batch ActionBatch, action Action, idx i
 			return rec, contract.ActionResult{}, err
 		}
 		storeSlot(bctx, action.As, result)
-		return rec, contract.ActionResult{Action: action.Type, OK: true, Backend: "ocr_tesseract", Details: map[string]any{"find_result": result}}, nil
+		return rec, contract.ActionResult{Action: action.Type, OK: true, Backend: "ocr_tesseract", Details: findResultDetails(result)}, nil
 	case "find_image":
 		result, err := runFindImage(ctx, action)
 		if err != nil {
 			return rec, contract.ActionResult{}, err
 		}
 		storeSlot(bctx, action.As, result)
-		return rec, contract.ActionResult{Action: action.Type, OK: true, Backend: "template_match", Details: map[string]any{"find_result": result}}, nil
+		return rec, contract.ActionResult{Action: action.Type, OK: true, Backend: "template_match", Details: findResultDetails(result)}, nil
 	case "find_color":
 		result, err := runFindColor(ctx, action)
 		if err != nil {
 			return rec, contract.ActionResult{}, err
 		}
 		storeSlot(bctx, action.As, result)
-		return rec, contract.ActionResult{Action: action.Type, OK: true, Backend: "color", Details: map[string]any{"find_result": result}}, nil
+		return rec, contract.ActionResult{Action: action.Type, OK: true, Backend: "color", Details: findResultDetails(result)}, nil
 	case "click_text":
 		// Hybrid: find phase always runs (observing); click phase
 		// skipped in dry-run. Result envelope still includes the
@@ -960,17 +970,19 @@ func dispatchAction(ctx context.Context, batch ActionBatch, action Action, idx i
 		if err != nil {
 			return rec, contract.ActionResult{}, err
 		}
+		details := map[string]any{
+			"changed":    res.Changed,
+			"diff":       res.Diff,
+			"polls":      res.Polls,
+			"elapsed_ms": res.ElapsedMS,
+			"last_state": res.LastState,
+		}
+		applyPixelClampDetails(details, res)
 		return rec, contract.ActionResult{
 			Action:  action.Type,
 			OK:      true,
 			Backend: "x11.GetImage",
-			Details: map[string]any{
-				"changed":    res.Changed,
-				"diff":       res.Diff,
-				"polls":      res.Polls,
-				"elapsed_ms": res.ElapsedMS,
-				"last_state": res.LastState,
-			},
+			Details: details,
 		}, nil
 	case "wait_for_text":
 		res, err := wait.WaitForText(ctx, wait.TextRequest{
@@ -987,50 +999,56 @@ func dispatchAction(ctx context.Context, batch ActionBatch, action Action, idx i
 		if err != nil {
 			return rec, contract.ActionResult{}, err
 		}
+		details := map[string]any{
+			"found":      res.Found,
+			"candidate":  res.Candidate,
+			"polls":      res.Polls,
+			"elapsed_ms": res.ElapsedMS,
+			"last_state": res.LastState,
+		}
+		applyTextClampDetails(details, res)
 		return rec, contract.ActionResult{
 			Action:  action.Type,
 			OK:      true,
 			Backend: "ocr_tesseract",
-			Details: map[string]any{
-				"found":      res.Found,
-				"candidate":  res.Candidate,
-				"polls":      res.Polls,
-				"elapsed_ms": res.ElapsedMS,
-				"last_state": res.LastState,
-			},
+			Details: details,
 		}, nil
 	default:
 		return rec, contract.ActionResult{}, contract.Validation("ACTION_UNSUPPORTED", "action type is unsupported", map[string]any{"type": action.Type})
 	}
 }
 
-// resolveRegion returns the effective screen-space region for a find
-// action. An explicit RegionRef is translated through
-// screen.ResolveCaptureRegion (handles window-space and monitor-space);
-// an empty region falls back to the focused-window bounds, then to the
-// full screen. The returned Bounds is always absolute screen-space so
-// downstream find_* candidate offsets and coord_map values remain
-// consistent regardless of the input space.
-func resolveRegion(ctx context.Context, region contract.RegionRef) (contract.Bounds, error) {
+// resolveRegionDetailed returns the effective screen-space region for
+// a find action along with optional clamp metadata. An explicit
+// RegionRef is translated through screen.ResolveCaptureRegionDetailed
+// (handles window-space and monitor-space, and surfaces the clamp
+// flag); an empty region falls back to the focused-window bounds, then
+// to the full screen. The returned Bounds is always absolute
+// screen-space so downstream find_* candidate offsets and coord_map
+// values remain consistent regardless of the input space. Empty region
+// inputs always report Clamped=false because no caller-supplied
+// rectangle was shrunk — the fallback path is always a deliberate
+// full-rect grab.
+func resolveRegionDetailed(ctx context.Context, region contract.RegionRef) (contract.ResolveResult, error) {
 	if !region.Empty() {
-		return screen.ResolveCaptureRegion(ctx, region)
+		return screen.ResolveCaptureRegionDetailed(ctx, region)
 	}
 	if focused, err := window.Focused(ctx); err == nil && focused != nil && !focused.Bounds.Empty() {
-		return focused.Bounds, nil
+		return contract.ResolveResult{Bounds: focused.Bounds}, nil
 	}
 	info, err := screen.Info(ctx)
 	if err != nil {
-		return contract.Bounds{}, err
+		return contract.ResolveResult{}, err
 	}
-	return info.Bounds, nil
+	return contract.ResolveResult{Bounds: info.Bounds}, nil
 }
 
 func runFindText(ctx context.Context, bctx *imageutil.BatchContext, action Action) (contract.FindResult, error) {
-	region, err := resolveRegion(ctx, action.Region)
+	regionRes, err := resolveRegionDetailed(ctx, action.Region)
 	if err != nil {
 		return contract.FindResult{}, err
 	}
-	img, capture, err := screen.CaptureRGBA(ctx, region)
+	img, capture, err := screen.CaptureRGBA(ctx, regionRes.Bounds)
 	if err != nil {
 		return contract.FindResult{}, err
 	}
@@ -1048,6 +1066,7 @@ func runFindText(ctx context.Context, bctx *imageutil.BatchContext, action Actio
 	if err != nil {
 		return contract.FindResult{}, err
 	}
+	annotateFindClamp(&result, regionRes)
 	if len(result.Candidates) == 0 {
 		return result, contract.Precondition("TARGET_NOT_FOUND", "find_text returned no candidates", map[string]any{"query": action.Query, "region": capture})
 	}
@@ -1055,11 +1074,11 @@ func runFindText(ctx context.Context, bctx *imageutil.BatchContext, action Actio
 }
 
 func runFindImage(ctx context.Context, action Action) (contract.FindResult, error) {
-	region, err := resolveRegion(ctx, action.Region)
+	regionRes, err := resolveRegionDetailed(ctx, action.Region)
 	if err != nil {
 		return contract.FindResult{}, err
 	}
-	img, capture, err := screen.CaptureRGBA(ctx, region)
+	img, capture, err := screen.CaptureRGBA(ctx, regionRes.Bounds)
 	if err != nil {
 		return contract.FindResult{}, err
 	}
@@ -1072,6 +1091,7 @@ func runFindImage(ctx context.Context, action Action) (contract.FindResult, erro
 	if err != nil {
 		return contract.FindResult{}, err
 	}
+	annotateFindClamp(&result, regionRes)
 	if len(result.Candidates) == 0 {
 		return result, contract.Precondition("TARGET_NOT_FOUND", "find_image returned no candidates", map[string]any{"template_path": action.TemplatePath, "region": capture})
 	}
@@ -1079,11 +1099,11 @@ func runFindImage(ctx context.Context, action Action) (contract.FindResult, erro
 }
 
 func runFindColor(ctx context.Context, action Action) (contract.FindResult, error) {
-	region, err := resolveRegion(ctx, action.Region)
+	regionRes, err := resolveRegionDetailed(ctx, action.Region)
 	if err != nil {
 		return contract.FindResult{}, err
 	}
-	img, capture, err := screen.CaptureRGBA(ctx, region)
+	img, capture, err := screen.CaptureRGBA(ctx, regionRes.Bounds)
 	if err != nil {
 		return contract.FindResult{}, err
 	}
@@ -1101,10 +1121,79 @@ func runFindColor(ctx context.Context, action Action) (contract.FindResult, erro
 	if err != nil {
 		return contract.FindResult{}, err
 	}
+	annotateFindClamp(&result, regionRes)
 	if len(result.Candidates) == 0 {
 		return result, contract.Precondition("TARGET_NOT_FOUND", "find_color returned no candidates", map[string]any{"color": action.Color, "region": capture})
 	}
 	return result, nil
+}
+
+// annotateFindClamp copies the clamp metadata from a ResolveResult onto
+// a FindResult so the find_* action response carries region_clamped,
+// original_region, and clamped_region next to its candidates. No-op
+// when the resolve did not clamp.
+func annotateFindClamp(result *contract.FindResult, res contract.ResolveResult) {
+	if !res.Clamped {
+		return
+	}
+	orig := res.OriginalRegion
+	clamped := res.ClampedRegion
+	result.RegionClamped = true
+	result.OriginalRegion = &orig
+	result.ClampedRegion = &clamped
+}
+
+// findResultDetails packages a FindResult into an ActionResult.Details
+// map, mirroring the existing "find_result" key for backwards compat
+// and adding top-level region_clamped/original_region/clamped_region
+// keys when the search region was silently shrunk to fit the
+// resolved-space bounds. Top-level keys exist alongside the nested
+// find_result (which also carries the same fields) so agents that scan
+// either layer pick up the clamp.
+func findResultDetails(result contract.FindResult) map[string]any {
+	details := map[string]any{"find_result": result}
+	if result.RegionClamped {
+		details["region_clamped"] = true
+		if result.OriginalRegion != nil {
+			details["original_region"] = *result.OriginalRegion
+		}
+		if result.ClampedRegion != nil {
+			details["clamped_region"] = *result.ClampedRegion
+		}
+	}
+	return details
+}
+
+// applyPixelClampDetails copies clamp metadata from a wait.PixelResult
+// onto an ActionResult.Details map so wait_for_pixel_change responses
+// surface region_clamped:true plus the original and clamped local
+// rectangles. No-op when the resolve did not clamp.
+func applyPixelClampDetails(details map[string]any, res wait.PixelResult) {
+	if !res.RegionClamped {
+		return
+	}
+	details["region_clamped"] = true
+	if res.OriginalRegion != nil {
+		details["original_region"] = *res.OriginalRegion
+	}
+	if res.ClampedRegion != nil {
+		details["clamped_region"] = *res.ClampedRegion
+	}
+}
+
+// applyTextClampDetails mirrors applyPixelClampDetails for
+// wait.TextResult.
+func applyTextClampDetails(details map[string]any, res wait.TextResult) {
+	if !res.RegionClamped {
+		return
+	}
+	details["region_clamped"] = true
+	if res.OriginalRegion != nil {
+		details["original_region"] = *res.OriginalRegion
+	}
+	if res.ClampedRegion != nil {
+		details["clamped_region"] = *res.ClampedRegion
+	}
 }
 
 func pickClickCandidate(cands []contract.FindCandidate, minConf float64, strict bool, what string) (contract.FindCandidate, error) {

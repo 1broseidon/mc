@@ -98,6 +98,18 @@ type PixelResult struct {
 	ElapsedMS int            `json:"elapsed_ms"`
 	Polls     int            `json:"polls"`
 	LastState map[string]any `json:"last_state"`
+	// RegionClamped reports that the request's region exceeded the
+	// resolved-space bounds (window client_bounds, monitor bounds, or
+	// screen bounds) and was silently shrunk to fit before polling
+	// began. Omitted when no clamp occurred so existing in-bounds calls
+	// return the same wire shape.
+	RegionClamped bool `json:"region_clamped,omitempty"`
+	// OriginalRegion is the local (pre-resolution) rectangle the caller
+	// requested. Present only when RegionClamped is true.
+	OriginalRegion *contract.Bounds `json:"original_region,omitempty"`
+	// ClampedRegion is the local (pre-resolution) rectangle actually
+	// polled after the clamp. Present only when RegionClamped is true.
+	ClampedRegion *contract.Bounds `json:"clamped_region,omitempty"`
 }
 
 // TextRequest carries the inputs for WaitForText. Region accepts the
@@ -123,6 +135,17 @@ type TextResult struct {
 	ElapsedMS int                     `json:"elapsed_ms"`
 	Polls     int                     `json:"polls"`
 	LastState map[string]any          `json:"last_state"`
+	// RegionClamped reports that the request's region exceeded the
+	// resolved-space bounds and was silently shrunk to fit before
+	// polling began. Omitted when no clamp occurred so existing
+	// in-bounds calls return the same wire shape.
+	RegionClamped bool `json:"region_clamped,omitempty"`
+	// OriginalRegion is the local (pre-resolution) rectangle the caller
+	// requested. Present only when RegionClamped is true.
+	OriginalRegion *contract.Bounds `json:"original_region,omitempty"`
+	// ClampedRegion is the local (pre-resolution) rectangle actually
+	// polled after the clamp. Present only when RegionClamped is true.
+	ClampedRegion *contract.Bounds `json:"clamped_region,omitempty"`
 }
 
 // presentValue returns the effective Present setting (default true).
@@ -279,11 +302,14 @@ func WaitForPixelChange(ctx context.Context, req PixelRequest) (PixelResult, err
 	// every poll. The resolved Bounds drives all subsequent CaptureRGBA
 	// calls — last_state and timeout details continue to report the
 	// resolved screen-space rectangle so agents see what was actually
-	// polled.
-	resolvedRegion, err := screen.ResolveCaptureRegion(ctx, req.Region)
+	// polled. The detailed result carries the clamp metadata when the
+	// requested rectangle exceeded the resolved-space bounds; we
+	// surface region_clamped on every PixelResult we return below.
+	resolveRes, err := screen.ResolveCaptureRegionDetailed(ctx, req.Region)
 	if err != nil {
 		return PixelResult{}, err
 	}
+	resolvedRegion := resolveRes.Bounds
 	timeout, poll := resolveDurations(req.TimeoutMS, req.PollMS, DefaultPixelTimeoutMS, DefaultPixelPollMS)
 	threshold := req.Threshold
 	if threshold <= 0 {
@@ -332,13 +358,15 @@ func WaitForPixelChange(ctx context.Context, req PixelRequest) (PixelResult, err
 		switch mode {
 		case PixelModeAny:
 			if diff >= threshold {
-				return PixelResult{
+				out := PixelResult{
 					Changed:   true,
 					Diff:      diff,
 					ElapsedMS: msSince(start),
 					Polls:     polls,
 					LastState: pixelLastState(diff, threshold, mode, stable),
-				}, nil
+				}
+				applyPixelClamp(&out, resolveRes)
+				return out, nil
 			}
 		case PixelModeStable:
 			// Compare to previous sample, not the baseline; "stable"
@@ -346,13 +374,15 @@ func WaitForPixelChange(ctx context.Context, req PixelRequest) (PixelResult, err
 			frameDiff := hashDiff(prevHash, curHash)
 			if frameDiff < threshold {
 				if time.Since(stableSince) >= stable {
-					return PixelResult{
+					out := PixelResult{
 						Changed:   true,
 						Diff:      diff,
 						ElapsedMS: msSince(start),
 						Polls:     polls,
 						LastState: pixelLastStateStable(diff, frameDiff, threshold, stable, time.Since(stableSince)),
-					}, nil
+					}
+					applyPixelClamp(&out, resolveRes)
+					return out, nil
 				}
 			} else {
 				stableSince = time.Now()
@@ -421,13 +451,20 @@ func WaitForText(ctx context.Context, req TextRequest) (TextResult, error) {
 	// shape consistent.
 	bctx := imageutil.NewBatchContext()
 	var lastCand *contract.FindCandidate
+	// Track the clamp metadata from the most recent resolve. Region
+	// resolution happens per-poll because the focused-window fallback
+	// can change between polls; whenever the explicit-region path
+	// surfaces a clamp we mirror it onto the returned TextResult so
+	// agents see the silent fix.
+	var lastResolve contract.ResolveResult
 	for {
 		polls++
-		region, err := resolveTextRegion(ctx, req.Region)
+		regionRes, err := resolveTextRegionDetailed(ctx, req.Region)
 		if err != nil {
 			return TextResult{}, err
 		}
-		img, capture, err := screen.CaptureRGBA(ctx, region)
+		lastResolve = regionRes
+		img, capture, err := screen.CaptureRGBA(ctx, regionRes.Bounds)
 		if err != nil {
 			return TextResult{}, err
 		}
@@ -452,23 +489,27 @@ func WaitForText(ctx context.Context, req TextRequest) (TextResult, error) {
 		lastCand = hit
 		if want {
 			if hit != nil {
-				return TextResult{
+				out := TextResult{
 					Found:     true,
 					Candidate: hit,
 					ElapsedMS: msSince(start),
 					Polls:     polls,
 					LastState: textLastState(req.Query, hit, want, len(result.Candidates)),
-				}, nil
+				}
+				applyTextClamp(&out, lastResolve)
+				return out, nil
 			}
 		} else {
 			if hit == nil {
-				return TextResult{
+				out := TextResult{
 					Found:     false,
 					Candidate: nil,
 					ElapsedMS: msSince(start),
 					Polls:     polls,
 					LastState: textLastState(req.Query, nil, want, 0),
-				}, nil
+				}
+				applyTextClamp(&out, lastResolve)
+				return out, nil
 			}
 		}
 		if time.Until(deadline) <= 0 {
@@ -480,23 +521,53 @@ func WaitForText(ctx context.Context, req TextRequest) (TextResult, error) {
 	}
 }
 
-// resolveTextRegion mirrors pipeline.resolveRegion: an explicit region
-// wins (and is translated through ResolveCaptureRegion so window/monitor-
-// space requests work), otherwise the focused window, otherwise the
-// full screen. Done inline here so the wait package doesn't take a
-// dependency on the pipeline package.
-func resolveTextRegion(ctx context.Context, region contract.RegionRef) (contract.Bounds, error) {
+// resolveTextRegionDetailed mirrors pipeline.resolveRegionDetailed: an
+// explicit region wins (and is translated through
+// ResolveCaptureRegionDetailed so window/monitor-space requests work
+// and the clamp flag surfaces), otherwise the focused window,
+// otherwise the full screen. Done inline here so the wait package
+// doesn't take a dependency on the pipeline package. Empty region
+// inputs always report Clamped=false; only an explicit caller-supplied
+// rectangle that exceeded its space gets clamped.
+func resolveTextRegionDetailed(ctx context.Context, region contract.RegionRef) (contract.ResolveResult, error) {
 	if !region.Empty() {
-		return screen.ResolveCaptureRegion(ctx, region)
+		return screen.ResolveCaptureRegionDetailed(ctx, region)
 	}
 	if focused, err := window.Focused(ctx); err == nil && focused != nil && !focused.Bounds.Empty() {
-		return focused.Bounds, nil
+		return contract.ResolveResult{Bounds: focused.Bounds}, nil
 	}
 	info, err := screen.Info(ctx)
 	if err != nil {
-		return contract.Bounds{}, err
+		return contract.ResolveResult{}, err
 	}
-	return info.Bounds, nil
+	return contract.ResolveResult{Bounds: info.Bounds}, nil
+}
+
+// applyPixelClamp copies ResolveResult clamp metadata onto a
+// PixelResult so the wait_for_pixel_change action response carries
+// region_clamped, original_region, and clamped_region next to its
+// diff. No-op when the resolve did not clamp.
+func applyPixelClamp(out *PixelResult, res contract.ResolveResult) {
+	if !res.Clamped {
+		return
+	}
+	orig := res.OriginalRegion
+	clamped := res.ClampedRegion
+	out.RegionClamped = true
+	out.OriginalRegion = &orig
+	out.ClampedRegion = &clamped
+}
+
+// applyTextClamp mirrors applyPixelClamp for TextResult.
+func applyTextClamp(out *TextResult, res contract.ResolveResult) {
+	if !res.Clamped {
+		return
+	}
+	orig := res.OriginalRegion
+	clamped := res.ClampedRegion
+	out.RegionClamped = true
+	out.OriginalRegion = &orig
+	out.ClampedRegion = &clamped
 }
 
 func textLastState(query string, cand *contract.FindCandidate, present bool, candidateCount int) map[string]any {

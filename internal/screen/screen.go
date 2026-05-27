@@ -232,39 +232,50 @@ func Cursor(ctx context.Context) (*contract.Point, error) {
 	return &contract.Point{X: int(reply.RootX), Y: int(reply.RootY), Space: "screen"}, nil
 }
 
-// ResolveCaptureRegion turns a coord-space-aware RegionRef into an
-// absolute screen-space Bounds suitable for XGetImage. Used by Capture
-// and by external callers (pipeline.runFind*, wait.WaitForPixelChange,
-// wait.WaitForText) that need to translate a window-space or
-// monitor-space region into screen coordinates before capturing.
+// ResolveCaptureRegionDetailed turns a coord-space-aware RegionRef
+// into a contract.ResolveResult carrying the absolute screen-space
+// Bounds suitable for XGetImage along with optional clamp metadata.
+// Used by Capture and by external callers (pipeline.runFind*,
+// wait.WaitForPixelChange, wait.WaitForText) that need to translate a
+// window-space or monitor-space region into screen coordinates before
+// capturing, and that surface region_clamped / original_region /
+// clamped_region in their action responses.
 //
-// Screen-space (or empty) RegionRefs pass through unchanged.
+// Screen-space (or empty) RegionRefs pass through unchanged (the
+// physical-screen clamp happens in Capture / CaptureRGBA, not here).
 // Window/window_frame regions require the window list (collected via
-// window.List); monitor regions require the monitor list (collected via
-// Info). Returns the validation/precondition errors emitted by
-// contract.ResolveRegion verbatim.
-func ResolveCaptureRegion(ctx context.Context, ref contract.RegionRef) (contract.Bounds, error) {
+// window.List); monitor regions require the monitor list (collected
+// via Info). Returns the validation/precondition errors emitted by
+// contract.ResolveRegionDetailed verbatim. Unknown spaces drop through
+// to contract.ResolveRegionDetailed so the canonical
+// INVALID_COORDINATE_SPACE error is consistent.
+func ResolveCaptureRegionDetailed(ctx context.Context, ref contract.RegionRef) (contract.ResolveResult, error) {
 	switch ref.Space {
 	case "", contract.CoordSpaceScreen:
 		// Fast path: no extra X11 round-trips when the caller already
-		// supplied screen-space coords.
-		return contract.ResolveRegion(ref, contract.ResolveContext{})
+		// supplied screen-space coords. Screen-space callers that want
+		// oversized-region clamping can still set Strict=true to opt
+		// into validation errors, but the actual clamp against the
+		// physical screen bounds happens in Capture/CaptureRGBA below
+		// (those clamp() calls already exist).
+		return contract.ResolveRegionDetailed(ref, contract.ResolveContext{})
 	case contract.CoordSpaceWindow, contract.CoordSpaceWindowFrame:
 		wins, err := window.List(ctx)
 		if err != nil {
-			return contract.Bounds{}, err
+			return contract.ResolveResult{}, err
 		}
-		return contract.ResolveRegion(ref, contract.ResolveContext{Windows: wins})
+		return contract.ResolveRegionDetailed(ref, contract.ResolveContext{Windows: wins})
 	case contract.CoordSpaceMonitor:
 		info, err := Info(ctx)
 		if err != nil {
-			return contract.Bounds{}, err
+			return contract.ResolveResult{}, err
 		}
-		return contract.ResolveRegion(ref, contract.ResolveContext{Monitors: info.Monitors})
+		return contract.ResolveRegionDetailed(ref, contract.ResolveContext{Monitors: info.Monitors})
 	default:
-		// Let ResolveRegion produce the canonical INVALID_COORDINATE_SPACE
-		// error so the wire surface is consistent.
-		return contract.ResolveRegion(ref, contract.ResolveContext{})
+		// Let ResolveRegionDetailed produce the canonical
+		// INVALID_COORDINATE_SPACE error so the wire surface is
+		// consistent.
+		return contract.ResolveRegionDetailed(ref, contract.ResolveContext{})
 	}
 }
 
@@ -316,12 +327,14 @@ func Capture(ctx context.Context, req CaptureRequest) (contract.ScreenshotResult
 	// the X server. Empty regions stay empty; the post-Open fallback
 	// below promotes them to the full screen.
 	var capture contract.Bounds
+	var resolveRes contract.ResolveResult
 	if !req.Region.Empty() {
-		resolved, err := ResolveCaptureRegion(ctx, req.Region)
+		res, err := ResolveCaptureRegionDetailed(ctx, req.Region)
 		if err != nil {
 			return contract.ScreenshotResult{}, err
 		}
-		capture = resolved
+		capture = res.Bounds
+		resolveRes = res
 	}
 
 	d, err := x11.Open()
@@ -401,14 +414,22 @@ func Capture(ctx context.Context, req CaptureRequest) (contract.ScreenshotResult
 	if err != nil {
 		return contract.ScreenshotResult{}, contract.Dependency("SCREENSHOT_ENCODE_FAILED", "failed to encode screenshot image", map[string]any{"path": out, "format": format, "error": err.Error()})
 	}
-	return contract.ScreenshotResult{
+	result := contract.ScreenshotResult{
 		ImagePath:     out,
 		MimeType:      mime,
 		CaptureBounds: capture,
 		ImageSize:     size,
 		CoordMap:      contract.NewCoordMap(capture, size).String(),
 		Backend:       "x11.GetImage",
-	}, nil
+	}
+	if resolveRes.Clamped {
+		orig := resolveRes.OriginalRegion
+		clamped := resolveRes.ClampedRegion
+		result.RegionClamped = true
+		result.OriginalRegion = &orig
+		result.ClampedRegion = &clamped
+	}
+	return result, nil
 }
 
 func clamp(region, screen contract.Bounds) contract.Bounds {

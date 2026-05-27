@@ -339,8 +339,22 @@ func TestResolveRegion(t *testing.T) {
 			wantErr: "WINDOW_NOT_FOUND",
 		},
 		{
-			name: "window region out of bounds",
+			// v0.3.4 default: oversized window-space region is clamped to
+			// the client bounds and the screen-space rect is returned. The
+			// Strict opt-in path is covered separately in
+			// TestResolveRegion_ClampOversize below.
+			name: "window region out of bounds clamps by default",
 			ref:  RegionRef{X: 0, Y: 0, Width: 9999, Height: 9999, Space: CoordSpaceWindow, Target: WindowTarget{ID: "0x1"}},
+			rctx: ResolveContext{Windows: []WindowInfo{{
+				ID: "0x1", XID: 1,
+				Bounds:       Bounds{X: 0, Y: 0, Width: 200, Height: 100},
+				ClientBounds: Bounds{X: 0, Y: 20, Width: 200, Height: 80},
+			}}},
+			want: Bounds{X: 0, Y: 20, Width: 200, Height: 80},
+		},
+		{
+			name: "window region out of bounds with strict rejected",
+			ref:  RegionRef{X: 0, Y: 0, Width: 9999, Height: 9999, Space: CoordSpaceWindow, Target: WindowTarget{ID: "0x1"}, Strict: true},
 			rctx: ResolveContext{Windows: []WindowInfo{{
 				ID: "0x1", XID: 1,
 				Bounds:       Bounds{X: 0, Y: 0, Width: 200, Height: 100},
@@ -398,6 +412,259 @@ func TestResolveRegion(t *testing.T) {
 				t.Fatalf("got %+v, want %+v", got, tc.want)
 			}
 		})
+	}
+}
+
+// TestResolveRegion_ClampOversize pins the v0.3.4 clamp-by-default
+// contract for oversized region requests. Window-, monitor-, and
+// (separately tested) screen-space callers that exceed the available
+// area get a clamped screen-space rectangle plus the OriginalRegion /
+// ClampedRegion metadata under ResolveResult so the screenshot,
+// find_*, and wait_for_* responses can surface region_clamped:true.
+// Strict callers (RegionRef.Strict=true) still receive
+// REGION_OUT_OF_BOUNDS — the fail-loudly path is preserved as an
+// opt-in.
+//
+// The cases cover the three coordinate spaces named in the task
+// contract — window (the original Codex repro), monitor, and the
+// screen-space passthrough surface (passthrough; clamp against the
+// physical screen happens in screen.CaptureRGBA, which lives in the
+// screen package, not here). The default-clamp branch is exercised
+// in addition to the strict-fail branch so future refactors that lose
+// the Strict toggle would surface as a test break.
+func TestResolveRegion_ClampOversize(t *testing.T) {
+	monitorIndex := 0
+
+	cases := []struct {
+		name       string
+		ref        RegionRef
+		rctx       ResolveContext
+		wantBounds Bounds
+		// when set, asserts ResolveResult.Clamped is true and the
+		// original / clamped local rects match.
+		wantClamped  bool
+		wantOriginal Bounds
+		wantClipped  Bounds
+		wantErr      string // non-empty when Strict path should error
+	}{
+		{
+			// Codex repro: window-space rectangle blows past the
+			// client bounds. Default clamps to the client bounds and
+			// returns the absolute screen-space rect. Original carries
+			// the requested {0,0,99999,99999}; clamped carries the
+			// client-bounds-relative rectangle {0,0,clientW,clientH}.
+			name: "window space oversize clamps to client bounds",
+			ref: RegionRef{
+				X: 0, Y: 0, Width: 99999, Height: 99999,
+				Space:  CoordSpaceWindow,
+				Target: WindowTarget{Class: "fam-ui"},
+			},
+			rctx: ResolveContext{Windows: []WindowInfo{{
+				ID: "0x1", Class: "fam-ui",
+				Bounds:       Bounds{X: 100, Y: 200, Width: 800, Height: 600},
+				ClientBounds: Bounds{X: 110, Y: 230, Width: 780, Height: 565},
+			}}},
+			wantBounds:   Bounds{X: 110, Y: 230, Width: 780, Height: 565},
+			wantClamped:  true,
+			wantOriginal: Bounds{X: 0, Y: 0, Width: 99999, Height: 99999},
+			wantClipped:  Bounds{X: 0, Y: 0, Width: 780, Height: 565},
+		},
+		{
+			name: "window space oversize with strict returns REGION_OUT_OF_BOUNDS",
+			ref: RegionRef{
+				X: 0, Y: 0, Width: 99999, Height: 99999,
+				Space:  CoordSpaceWindow,
+				Target: WindowTarget{Class: "fam-ui"},
+				Strict: true,
+			},
+			rctx: ResolveContext{Windows: []WindowInfo{{
+				ID: "0x1", Class: "fam-ui",
+				Bounds:       Bounds{X: 100, Y: 200, Width: 800, Height: 600},
+				ClientBounds: Bounds{X: 110, Y: 230, Width: 780, Height: 565},
+			}}},
+			wantErr: "REGION_OUT_OF_BOUNDS",
+		},
+		{
+			// Partial overshoot: caller asks for {50,100,1000,500} but
+			// the window is only 200x100 wide. Clamp shrinks to
+			// {50,100,150,0}? No — clamp output keeps the offset and
+			// shrinks the extent. wait — y=100 is past the 100-tall
+			// client_bounds. We pick a case where the clamp leaves a
+			// non-empty rectangle: offset 50,10 + size 1000,500 against
+			// a 200x100 client.
+			name: "window space partial overshoot clamps offset+extent",
+			ref: RegionRef{
+				X: 50, Y: 10, Width: 1000, Height: 500,
+				Space:  CoordSpaceWindow,
+				Target: WindowTarget{ID: "0x1"},
+			},
+			rctx: ResolveContext{Windows: []WindowInfo{{
+				ID: "0x1", XID: 1,
+				Bounds:       Bounds{X: 0, Y: 0, Width: 200, Height: 100},
+				ClientBounds: Bounds{X: 0, Y: 20, Width: 200, Height: 80},
+			}}},
+			wantBounds:   Bounds{X: 50, Y: 30, Width: 150, Height: 70},
+			wantClamped:  true,
+			wantOriginal: Bounds{X: 50, Y: 10, Width: 1000, Height: 500},
+			wantClipped:  Bounds{X: 50, Y: 10, Width: 150, Height: 70},
+		},
+		{
+			// window_frame-space oversize: clamp anchors on the outer
+			// bounds, not client_bounds. Original caller asked for
+			// {0,0,99999,99999} which we shrink to the outer rectangle.
+			name: "window_frame space oversize clamps to outer bounds",
+			ref: RegionRef{
+				X: 0, Y: 0, Width: 99999, Height: 99999,
+				Space:  CoordSpaceWindowFrame,
+				Target: WindowTarget{Class: "fam-ui"},
+			},
+			rctx: ResolveContext{Windows: []WindowInfo{{
+				ID: "0x1", Class: "fam-ui",
+				Bounds:       Bounds{X: 100, Y: 200, Width: 800, Height: 600},
+				ClientBounds: Bounds{X: 110, Y: 230, Width: 780, Height: 565},
+			}}},
+			wantBounds:   Bounds{X: 100, Y: 200, Width: 800, Height: 600},
+			wantClamped:  true,
+			wantOriginal: Bounds{X: 0, Y: 0, Width: 99999, Height: 99999},
+			wantClipped:  Bounds{X: 0, Y: 0, Width: 800, Height: 600},
+		},
+		{
+			name: "monitor space oversize clamps to monitor bounds",
+			ref: RegionRef{
+				X: 0, Y: 0, Width: 99999, Height: 99999,
+				Space:        CoordSpaceMonitor,
+				MonitorIndex: &monitorIndex,
+			},
+			rctx: ResolveContext{Monitors: []MonitorInfo{
+				{Bounds: Bounds{X: 0, Y: 0, Width: 1920, Height: 1080}},
+			}},
+			wantBounds:   Bounds{X: 0, Y: 0, Width: 1920, Height: 1080},
+			wantClamped:  true,
+			wantOriginal: Bounds{X: 0, Y: 0, Width: 99999, Height: 99999},
+			wantClipped:  Bounds{X: 0, Y: 0, Width: 1920, Height: 1080},
+		},
+		{
+			name: "monitor space oversize with strict returns REGION_OUT_OF_BOUNDS",
+			ref: RegionRef{
+				X: 0, Y: 0, Width: 99999, Height: 99999,
+				Space:        CoordSpaceMonitor,
+				MonitorIndex: &monitorIndex,
+				Strict:       true,
+			},
+			rctx: ResolveContext{Monitors: []MonitorInfo{
+				{Bounds: Bounds{X: 0, Y: 0, Width: 1920, Height: 1080}},
+			}},
+			wantErr: "REGION_OUT_OF_BOUNDS",
+		},
+		{
+			// Screen-space passthrough: ResolveRegion does NOT clamp
+			// against the physical screen bounds — that responsibility
+			// stays with screen.CaptureRGBA / screen.Capture which
+			// already do their own clamp(). So an oversized screen-space
+			// region passes through unchanged. This case pins that
+			// behavior so future refactors that move the clamp up into
+			// contract would have to explicitly opt screen-space in.
+			name: "screen space oversize passes through unchanged",
+			ref: RegionRef{
+				X: 0, Y: 0, Width: 99999, Height: 99999,
+				Space: CoordSpaceScreen,
+			},
+			wantBounds: Bounds{X: 0, Y: 0, Width: 99999, Height: 99999},
+		},
+		{
+			// In-bounds window-space request: clamp must NOT fire so
+			// the response wire shape matches v0.3.3 exactly. This is
+			// the "no new fields when no clamp happens" backward-compat
+			// pin from the task contract.
+			name: "window space in-bounds does not clamp",
+			ref: RegionRef{
+				X: 5, Y: 10, Width: 50, Height: 60,
+				Space:  CoordSpaceWindow,
+				Target: WindowTarget{ID: "0x1"},
+			},
+			rctx: ResolveContext{Windows: []WindowInfo{{
+				ID: "0x1", XID: 1,
+				Bounds:       Bounds{X: 0, Y: 0, Width: 800, Height: 600},
+				ClientBounds: Bounds{X: 10, Y: 30, Width: 780, Height: 565},
+			}}},
+			wantBounds: Bounds{X: 15, Y: 40, Width: 50, Height: 60},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := ResolveRegionDetailed(tc.ref, tc.rctx)
+			if tc.wantErr != "" {
+				if err == nil {
+					t.Fatalf("expected error %q, got %+v", tc.wantErr, got)
+				}
+				var app *AppError
+				if !errors.As(err, &app) {
+					t.Fatalf("expected AppError, got %T: %v", err, err)
+				}
+				if app.Code != tc.wantErr {
+					t.Fatalf("code = %q, want %q", app.Code, tc.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got.Bounds != tc.wantBounds {
+				t.Fatalf("Bounds = %+v, want %+v", got.Bounds, tc.wantBounds)
+			}
+			if got.Clamped != tc.wantClamped {
+				t.Fatalf("Clamped = %v, want %v", got.Clamped, tc.wantClamped)
+			}
+			if tc.wantClamped {
+				if got.OriginalRegion != tc.wantOriginal {
+					t.Fatalf("OriginalRegion = %+v, want %+v", got.OriginalRegion, tc.wantOriginal)
+				}
+				if got.ClampedRegion != tc.wantClipped {
+					t.Fatalf("ClampedRegion = %+v, want %+v", got.ClampedRegion, tc.wantClipped)
+				}
+			} else {
+				// When no clamp occurred the metadata must stay
+				// zero-valued so JSON marshaling omits the optional
+				// region_clamped / original_region / clamped_region
+				// fields downstream.
+				if got.OriginalRegion != (Bounds{}) {
+					t.Fatalf("OriginalRegion should be zero when not clamped, got %+v", got.OriginalRegion)
+				}
+				if got.ClampedRegion != (Bounds{}) {
+					t.Fatalf("ClampedRegion should be zero when not clamped, got %+v", got.ClampedRegion)
+				}
+			}
+		})
+	}
+}
+
+// TestResolveRegion_ClampWindowFullyOutsideBounds pins the edge case
+// where a clamp would leave a zero-area rectangle: the clamped result
+// is unrecoverable so we surface REGION_OUT_OF_BOUNDS regardless of
+// Strict. Documents the intent — clamp-by-default only helps when
+// there is some non-empty sub-rectangle inside the available area.
+func TestResolveRegion_ClampWindowFullyOutsideBounds(t *testing.T) {
+	ref := RegionRef{
+		X: 500, Y: 500, Width: 10, Height: 10,
+		Space:  CoordSpaceWindow,
+		Target: WindowTarget{ID: "0x1"},
+	}
+	rctx := ResolveContext{Windows: []WindowInfo{{
+		ID: "0x1", XID: 1,
+		Bounds:       Bounds{X: 0, Y: 0, Width: 200, Height: 100},
+		ClientBounds: Bounds{X: 0, Y: 0, Width: 200, Height: 100},
+	}}}
+	_, err := ResolveRegionDetailed(ref, rctx)
+	if err == nil {
+		t.Fatal("expected REGION_OUT_OF_BOUNDS for region entirely outside the window")
+	}
+	var app *AppError
+	if !errors.As(err, &app) {
+		t.Fatalf("expected AppError, got %T: %v", err, err)
+	}
+	if app.Code != "REGION_OUT_OF_BOUNDS" {
+		t.Fatalf("code = %q, want REGION_OUT_OF_BOUNDS", app.Code)
 	}
 }
 
