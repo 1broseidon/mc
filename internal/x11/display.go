@@ -52,6 +52,26 @@ func AutoDetectDisplay() AutoDetectResult {
 	return AutoDetectDisplayIn(x11SocketDir, 100*time.Millisecond)
 }
 
+// MaybeAutoDetectDisplay initializes DISPLAY for this process when the
+// environment is unset and exactly one live X11 socket is discoverable.
+// Explicit DISPLAY values are always respected. Ambiguous or empty probe
+// results are returned without mutating the environment so callers can
+// surface a machine-readable error at the boundary they own.
+func MaybeAutoDetectDisplay() AutoDetectResult {
+	return maybeAutoDetectDisplayWith(AutoDetectDisplay)
+}
+
+func maybeAutoDetectDisplayWith(probe func() AutoDetectResult) AutoDetectResult {
+	if os.Getenv("DISPLAY") != "" {
+		return AutoDetectResult{}
+	}
+	res := probe()
+	if res.Display != "" {
+		_ = os.Setenv("DISPLAY", res.Display)
+	}
+	return res
+}
+
 // AutoDetectDisplayIn is the parameterised form of AutoDetectDisplay
 // used by tests. The dir argument is the X11 socket directory and
 // perCandidateTimeout caps each individual unix-socket dial.
@@ -113,7 +133,11 @@ func Open() (*Display, error) {
 		err  error
 	)
 	if name == "" {
-		return nil, contract.Precondition("DISPLAY_UNSET", "DISPLAY is not set; MyComputer needs an X11 display", nil)
+		auto := MaybeAutoDetectDisplay()
+		name = os.Getenv("DISPLAY")
+		if name == "" {
+			return nil, displayResolutionError(auto)
+		}
 	}
 	conn, err = xgb.NewConnDisplay(name)
 	if err != nil {
@@ -130,7 +154,20 @@ func (d *Display) Close() {
 	}
 }
 
+func displayResolutionError(res AutoDetectResult) error {
+	if len(res.Ambiguous) > 0 {
+		return contract.Precondition("DISPLAY_AMBIGUOUS", "DISPLAY is unset and multiple live X11 displays were found", map[string]any{
+			"candidates":  res.Ambiguous,
+			"remediation": "set DISPLAY explicitly or pass 'mycomputer serve --display <value>'",
+		})
+	}
+	return contract.Precondition("DISPLAY_UNSET", "DISPLAY is not set; MyComputer needs an X11 display", map[string]any{
+		"remediation": "launch the MCP host from an X session or set DISPLAY explicitly",
+	})
+}
+
 func Probe() []contract.BackendStatus {
+	MaybeAutoDetectDisplay()
 	now := time.Now().UTC()
 	statuses := []contract.BackendStatus{
 		envStatus("DISPLAY", os.Getenv("DISPLAY") != "", true, now),

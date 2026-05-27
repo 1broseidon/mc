@@ -18,6 +18,7 @@ import (
 	"crypto/sha1"
 	"encoding/csv"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"image"
 	"image/color"
@@ -216,7 +217,18 @@ func FindText(ctx context.Context, batch *BatchContext, region contract.Bounds, 
 	psmRetried := false
 	words, err := runOCR(ctx, batch, region, prepped, lang, applied, psmUsed, req.OEM)
 	if err != nil {
-		return contract.FindResult{}, err
+		if shouldSmartRetryOCR(region, req.PSM) && isOCROutputMissing(err) {
+			retryWords, retryErr := runOCR(ctx, batch, region, prepped, lang, applied, smartRetryPSM, req.OEM)
+			if retryErr == nil {
+				words = retryWords
+				psmUsed = smartRetryPSM
+				psmRetried = true
+			} else {
+				return contract.FindResult{}, err
+			}
+		} else {
+			return contract.FindResult{}, err
+		}
 	}
 
 	minConf := req.MinConfidence
@@ -323,8 +335,7 @@ func FindText(ctx context.Context, batch *BatchContext, region contract.Bounds, 
 	// retry still produces zero, we fall through to the canonical
 	// TARGET_NOT_FOUND path unchanged. Explicit psm disables the retry
 	// entirely so existing-caller output stays bit-for-bit identical.
-	regionArea := region.Width * region.Height
-	if len(cands) == 0 && req.PSM == 0 && regionArea > 0 && regionArea < smartPSMRegionThresholdPx {
+	if !psmRetried && len(cands) == 0 && shouldSmartRetryOCR(region, req.PSM) {
 		retryWords, retryErr := runOCR(ctx, batch, region, prepped, lang, applied, smartRetryPSM, req.OEM)
 		if retryErr == nil {
 			psmUsed = smartRetryPSM
@@ -338,6 +349,20 @@ func FindText(ctx context.Context, batch *BatchContext, region contract.Bounds, 
 		SearchRegion: region,
 		CoordSpace:   contract.CoordSpaceScreen,
 	}, nil
+}
+
+func shouldSmartRetryOCR(region contract.Bounds, psm int) bool {
+	regionArea := region.Width * region.Height
+	return psm == 0 && regionArea > 0 && regionArea < smartPSMRegionThresholdPx
+}
+
+func isOCROutputMissing(err error) bool {
+	var app *contract.AppError
+	if !errors.As(err, &app) || app.Code != "OCR_RUN_FAILED" {
+		return false
+	}
+	reason, _ := app.Details["reason"].(string)
+	return reason == "output_missing"
 }
 
 // runOCR shells out to tesseract with a temp PNG, returning recognized
@@ -382,8 +407,12 @@ func runOCR(ctx context.Context, batch *BatchContext, region contract.Bounds, im
 	}
 	_ = tmpIn.Close()
 
-	tmpOutBase := filepath.Join(os.TempDir(), "mycomputer-ocr-out-"+hash)
-	defer func() { _ = os.Remove(tmpOutBase + ".tsv") }()
+	tmpOutDir, err := os.MkdirTemp("", "mycomputer-ocr-out-*")
+	if err != nil {
+		return nil, contract.Dependency("OCR_TEMP_FAILED", "failed to allocate OCR output directory", map[string]any{"error": err.Error()})
+	}
+	defer func() { _ = os.RemoveAll(tmpOutDir) }()
+	tmpOutBase := filepath.Join(tmpOutDir, "out")
 
 	args := []string{tmpIn.Name(), tmpOutBase, "-l", lang}
 	if psm != 0 {
@@ -397,12 +426,12 @@ func runOCR(ctx context.Context, batch *BatchContext, region contract.Bounds, im
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
-		return nil, contract.Dependency("OCR_RUN_FAILED", "tesseract execution failed", map[string]any{"error": err.Error(), "stderr": stderr.String()})
+		return nil, contract.Dependency("OCR_RUN_FAILED", "tesseract execution failed", map[string]any{"reason": "tesseract_exit", "error": err.Error(), "stderr": stderr.String()})
 	}
 
 	tsv, err := os.ReadFile(tmpOutBase + ".tsv")
 	if err != nil {
-		return nil, contract.Dependency("OCR_RUN_FAILED", "tesseract output not found", map[string]any{"error": err.Error()})
+		return nil, contract.Dependency("OCR_RUN_FAILED", "tesseract output not found", map[string]any{"reason": "output_missing", "error": err.Error()})
 	}
 	words, err := parseTesseractTSV(tsv)
 	if err != nil {

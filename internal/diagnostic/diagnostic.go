@@ -44,7 +44,7 @@ var ewmhAtomToCapability = []struct {
 // inject the catalog to keep AvailableTools drift-free.
 func Doctor(version contract.VersionInfo, cfg config.Effective, tools []string) contract.DoctorReport {
 	version.Go = runtime.Version()
-	autoDisplay := maybeAutoDetectDisplay()
+	autoDisplay := x11.MaybeAutoDetectDisplay()
 	backends := x11.Probe()
 	annotateDisplayAutoDetect(backends, autoDisplay)
 	annotateEWMHCapabilities(backends)
@@ -191,28 +191,6 @@ func probeAudit(now time.Time) contract.BackendStatus {
 		},
 		CheckedAt: now,
 	}
-}
-
-// maybeAutoDetectDisplay runs the /tmp/.X11-unix/ socket probe only
-// when DISPLAY is unset/empty and, on a singular live socket, sets
-// DISPLAY for the current mc process via os.Setenv. Explicit DISPLAY
-// values are respected — the function returns an empty result and the
-// existing env is left alone. This addresses the MCP-host case where
-// Codex / Claude Code spawn 'mycomputer serve' from a non-X-aware shell
-// (.desktop launchers, systemd user units, IDE integrated terminals)
-// without DISPLAY in their inherited env.
-//
-// Constraint: NEVER mutate the caller's shell env — os.Setenv only
-// affects this process and its children.
-func maybeAutoDetectDisplay() x11.AutoDetectResult {
-	if os.Getenv("DISPLAY") != "" {
-		return x11.AutoDetectResult{}
-	}
-	res := x11.AutoDetectDisplay()
-	if res.Display != "" {
-		_ = os.Setenv("DISPLAY", res.Display)
-	}
-	return res
 }
 
 // annotateDisplayAutoDetect rewrites the DISPLAY backend row to reflect

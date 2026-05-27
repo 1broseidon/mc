@@ -108,6 +108,48 @@ func TestComputerActionsRejectsMissingSchemaVersion(t *testing.T) {
 	<-errCh
 }
 
+func TestToolAppErrorsUseMachineReadableBody(t *testing.T) {
+	serverTransport, clientTransport := mcp.NewInMemoryTransports()
+	server := New(Options{
+		Version: contract.VersionInfo{Version: "test", Commit: "test", Built: "test"},
+		Config:  config.Effective{ScreenshotDir: t.TempDir(), Sources: map[string]string{}},
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	errCh := make(chan error, 1)
+	go func() { errCh <- server.Run(ctx, serverTransport) }()
+
+	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "test"}, nil)
+	session, err := client.Connect(ctx, clientTransport, nil)
+	if err != nil {
+		t.Fatalf("client connect failed: %v", err)
+	}
+	defer func() { _ = session.Close() }()
+
+	result, err := session.CallTool(ctx, &mcp.CallToolParams{
+		Name:      "paste",
+		Arguments: map[string]any{"method": "bogus"},
+	})
+	if err != nil {
+		t.Fatalf("CallTool should return a tool error body, not transport error: %v", err)
+	}
+	if !result.IsError {
+		t.Fatalf("expected tool result to be flagged as error, got success: %+v", result)
+	}
+	var bodyText string
+	for _, c := range result.Content {
+		if tc, ok := c.(*mcp.TextContent); ok {
+			bodyText += tc.Text
+		}
+	}
+	if !strings.Contains(bodyText, `"code":"PASTE_METHOD_INVALID"`) {
+		t.Fatalf("expected machine-readable AppError JSON in result body: %s", bodyText)
+	}
+
+	cancel()
+	<-errCh
+}
+
 func TestSupportedSchemaVersionsExported(t *testing.T) {
 	got := SupportedSchemaVersions()
 	if len(got) == 0 {

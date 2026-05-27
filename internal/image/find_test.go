@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/1broseidon/mc/internal/contract"
@@ -37,6 +38,16 @@ func loadFixturePNG(t *testing.T, name string) *image.RGBA {
 func tesseractAvailable() bool {
 	_, err := exec.LookPath("tesseract")
 	return err == nil
+}
+
+func installFakeTesseract(t *testing.T, body string) {
+	t.Helper()
+	binDir := t.TempDir()
+	path := filepath.Join(binDir, "tesseract")
+	if err := os.WriteFile(path, []byte("#!/bin/sh\n"+body), 0o755); err != nil {
+		t.Fatalf("write fake tesseract: %v", err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 }
 
 func TestFindText_HappyPath(t *testing.T) {
@@ -122,6 +133,93 @@ func TestFindText_BatchCacheReusesOCR(t *testing.T) {
 	second := bctx.OCRCalls()
 	if first != 1 || second != 1 {
 		t.Fatalf("OCR was invoked %d then %d times, want 1 then 1 (batch cache hit)", first, second)
+	}
+}
+
+func TestFindText_ParallelSameImageUsesUniqueOCROutput(t *testing.T) {
+	logPath := filepath.Join(t.TempDir(), "out-bases.log")
+	t.Setenv("FAKE_TESSERACT_LOG", logPath)
+	installFakeTesseract(t, `
+if [ -n "$FAKE_TESSERACT_LOG" ]; then
+  printf '%s\n' "$2" >> "$FAKE_TESSERACT_LOG"
+fi
+sleep 0.02
+printf 'level\tpage_num\tblock_num\tpar_num\tline_num\tword_num\tleft\ttop\twidth\theight\tconf\ttext\n5\t1\t1\t1\t1\t1\t10\t8\t48\t16\t96\tHELLO\n' > "$2.tsv"
+`)
+
+	img := image.NewRGBA(image.Rect(0, 0, 120, 40))
+	draw.Draw(img, img.Bounds(), &image.Uniform{C: color.RGBA{255, 255, 255, 255}}, image.Point{}, draw.Src)
+	region := contract.Bounds{X: 0, Y: 0, Width: img.Bounds().Dx(), Height: img.Bounds().Dy()}
+
+	const workers = 12
+	var wg sync.WaitGroup
+	errCh := make(chan error, workers)
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			res, err := FindText(context.Background(), nil, region, img, FindTextRequest{Query: "HELLO", PSM: 6})
+			if err != nil {
+				errCh <- err
+				return
+			}
+			if len(res.Candidates) != 1 {
+				errCh <- contract.Precondition("TEST_BAD_CANDIDATES", "unexpected candidate count", map[string]any{"count": len(res.Candidates)})
+			}
+		}()
+	}
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		t.Fatalf("parallel FindText failed: %v", err)
+	}
+
+	raw, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("read fake tesseract log: %v", err)
+	}
+	lines := strings.Fields(string(raw))
+	if len(lines) != workers {
+		t.Fatalf("fake tesseract calls = %d, want %d; log=%q", len(lines), workers, string(raw))
+	}
+	seen := map[string]bool{}
+	for _, line := range lines {
+		seen[line] = true
+	}
+	if len(seen) != workers {
+		t.Fatalf("OCR output bases were not unique per invocation: got %d unique for %d calls; log=%q", len(seen), workers, string(raw))
+	}
+}
+
+func TestFindText_SmartPSMRetryOnMissingTSV(t *testing.T) {
+	installFakeTesseract(t, `
+case " $* " in
+  *" --psm 11 "*)
+    printf 'level\tpage_num\tblock_num\tpar_num\tline_num\tword_num\tleft\ttop\twidth\theight\tconf\ttext\n5\t1\t1\t1\t1\t1\t12\t9\t30\t14\t91\tOK\n' > "$2.tsv"
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+`)
+
+	img := image.NewRGBA(image.Rect(0, 0, 160, 50))
+	draw.Draw(img, img.Bounds(), &image.Uniform{C: color.RGBA{255, 255, 255, 255}}, image.Point{}, draw.Src)
+	region := contract.Bounds{X: 10, Y: 20, Width: img.Bounds().Dx(), Height: img.Bounds().Dy()}
+
+	res, err := FindText(context.Background(), nil, region, img, FindTextRequest{Query: "OK"})
+	if err != nil {
+		t.Fatalf("FindText error: %v", err)
+	}
+	if len(res.Candidates) != 1 {
+		t.Fatalf("got %d candidates, want 1", len(res.Candidates))
+	}
+	got := res.Candidates[0]
+	if retried, _ := got.Extra["psm_retried"].(bool); !retried {
+		t.Fatalf("psm_retried = %v, want true (extra=%v)", got.Extra["psm_retried"], got.Extra)
+	}
+	if used, _ := got.Extra["psm_used"].(int); used != smartRetryPSM {
+		t.Fatalf("psm_used = %v, want %d (extra=%v)", got.Extra["psm_used"], smartRetryPSM, got.Extra)
 	}
 }
 

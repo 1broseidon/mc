@@ -2,6 +2,7 @@ package mcpserver
 
 import (
 	"context"
+	"errors"
 	"strings"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -17,6 +18,7 @@ import (
 	"github.com/1broseidon/mc/internal/screen"
 	"github.com/1broseidon/mc/internal/wait"
 	"github.com/1broseidon/mc/internal/window"
+	"github.com/1broseidon/mc/internal/x11"
 )
 
 type Options struct {
@@ -80,6 +82,11 @@ func GetServerInfo(version contract.VersionInfo) ServerInfo {
 }
 
 func New(opts Options) *mcp.Server {
+	// MCP hosts are often launched from shells or desktop entries that
+	// do not inherit DISPLAY. Initialize it once at server construction
+	// when a single live X socket is discoverable; unresolved cases stay
+	// unset so individual tools can return structured AppErrors.
+	x11.MaybeAutoDetectDisplay()
 	instructions := "MyComputer drives an X11 desktop for agents. computer_actions payloads require schema_version=\"" +
 		contract.SchemaVersion + "\". Supported schema_versions: " +
 		strings.Join(contract.SupportedSchemaVersions(), ", ") + "."
@@ -469,6 +476,22 @@ func windowMCPResult(action string, res window.VerbResult, err error) contract.A
 func add[In, Out any](s *mcp.Server, name, description string, readOnly bool, destructive bool, handler mcp.ToolHandlerFor[In, Out]) {
 	openWorld := true
 	destructiveHint := destructive
+	wrapped := func(ctx context.Context, req *mcp.CallToolRequest, in In) (*mcp.CallToolResult, Out, error) {
+		res, out, err := handler(ctx, req, in)
+		if err == nil {
+			return res, out, nil
+		}
+		var app *contract.AppError
+		if errors.As(err, &app) {
+			return &mcp.CallToolResult{
+				IsError: true,
+				Content: []mcp.Content{
+					&mcp.TextContent{Text: string(contract.MarshalError(app))},
+				},
+			}, out, nil
+		}
+		return res, out, err
+	}
 	mcp.AddTool(s, &mcp.Tool{
 		Name:        name,
 		Description: description,
@@ -477,7 +500,7 @@ func add[In, Out any](s *mcp.Server, name, description string, readOnly bool, de
 			DestructiveHint: &destructiveHint,
 			OpenWorldHint:   &openWorld,
 		},
-	}, handler)
+	}, wrapped)
 	toolCatalog = append(toolCatalog, ToolInfo{
 		Name:        name,
 		Description: description,

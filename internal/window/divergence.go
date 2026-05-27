@@ -19,7 +19,7 @@ import (
 const divergenceProbeSize = 50
 
 // divergenceMatchTolerance is the per-channel tolerance used when
-// counting "matches root color" pixels in the sampled patch.
+// counting "matches background color" pixels in the sampled patch.
 const divergenceMatchTolerance = 15
 
 // divergenceMatchFraction is the patch-match fraction at or above
@@ -28,17 +28,59 @@ const divergenceMatchTolerance = 15
 // "rendered surface didn't follow the WM resize" failure mode.
 const divergenceMatchFraction = 0.7
 
+// divergenceEdgeConsensusMin is the number of edge probes that must
+// agree on the exposed-background color before the no-outside-desktop
+// fallback fires. This keeps the fullscreen/maximized path from trusting
+// one lucky corner sample.
+const divergenceEdgeConsensusMin = 3
+
+// divergenceAnchorMaxMatchFraction is the maximum allowed match between
+// the top-left client anchor and the exposed-background color in the
+// edge-consensus fallback. A matching anchor means the window may simply
+// have a uniform app background, not a stale smaller rendered surface.
+const divergenceAnchorMaxMatchFraction = 0.4
+
+// divergenceMinFallbackShrinkPx and divergenceMinRenderedExtentPx keep
+// the edge-consensus fallback conservative: without an outside-client
+// desktop reference, only warn when both axes shrink materially and the
+// estimated rendered surface is large enough to plausibly be the old app
+// surface rather than a toolbar/sidebar sliver.
+const (
+	divergenceMinFallbackShrinkPx = divergenceProbeSize
+	divergenceMinRenderedExtentPx = divergenceProbeSize * 2
+)
+
+type patchSampler func(contract.Bounds) ([]color.RGBA, contract.Bounds, bool)
+
+type backgroundSample struct {
+	color  color.RGBA
+	region contract.Bounds
+	source string
+}
+
+type divergenceAnalysis struct {
+	background          color.RGBA
+	backgroundSource    string
+	backgroundRegion    contract.Bounds
+	probeRegion         contract.Bounds
+	matchFraction       float64
+	edgeConsensus       int
+	edgeProbes          int
+	anchorMatchFraction float64
+	estimate            contract.Bounds
+}
+
 // detectGeometryDivergence checks whether the WM-reported client_bounds
-// for `info` actually contains rendered app content or just exposes
-// the root window's wallpaper. Returns a populated *VerbWarning when
-// the patch at the bottom-right interior corner of client_bounds
-// matches the root-window's dominant color above
-// divergenceMatchFraction; returns nil otherwise.
+// for `info` actually contains rendered app content or exposed desktop.
+// It first compares the bottom-right client patch against desktop
+// samples that are outside the client rectangle. When a maximized window
+// leaves no outside desktop to sample, it falls back to a conservative
+// multi-edge consensus: several client-edge patches must agree on the
+// same exposed-background color while the top-left anchor differs.
 //
-// Best-effort heuristic — any X11 sampling failure returns nil so the
-// host verb still reports success. False positives are acceptable;
-// false negatives are acceptable. Cost: one XGetImage for the root
-// reference sample plus one for the client patch.
+// Best-effort heuristic: X11 sampling failures return nil so the host
+// verb still reports success. The warning is advisory and includes a
+// rendered_bounds_estimate for agents that need a safer target region.
 func detectGeometryDivergence(d *x11.Display, info contract.WindowInfo) *VerbWarning {
 	client := info.ClientBounds
 	if client.Empty() {
@@ -48,40 +90,15 @@ func detectGeometryDivergence(d *x11.Display, info contract.WindowInfo) *VerbWar
 		// Patch wouldn't fit; skip rather than oversample a tiny window.
 		return nil
 	}
-	rootColor, ok := dominantRootColor(d)
+	screen := x11.ScreenBounds(d)
+	sampler := func(region contract.Bounds) ([]color.RGBA, contract.Bounds, bool) {
+		return samplePatch(d, region, screen)
+	}
+	analysis, ok := analyzeGeometryDivergence(client, screen, sampler)
 	if !ok {
 		return nil
 	}
-	patch, patchBounds, ok := samplePatchAtCorner(d, client)
-	if !ok {
-		return nil
-	}
-	matches := countColorMatches(patch, rootColor, divergenceMatchTolerance)
-	total := len(patch)
-	if total == 0 {
-		return nil
-	}
-	fraction := float64(matches) / float64(total)
-	if fraction < divergenceMatchFraction {
-		return nil
-	}
-	estimate := estimateRenderedBounds(d, client, rootColor)
-	details := map[string]any{
-		"wm_bounds":                client,
-		"rendered_bounds_estimate": estimate,
-		"probe": map[string]any{
-			"region":         patchBounds,
-			"match_fraction": fraction,
-			"tolerance_px":   divergenceMatchTolerance,
-			"root_color":     formatRGB(rootColor),
-		},
-		"suggestion": "app may not be tracking ConfigureNotify; coordinate-based clicks at WM bounds may miss the rendered surface",
-	}
-	return &VerbWarning{
-		Code:    contract.WindowGeometryDivergedCode,
-		Message: "rendered surface appears smaller than WM-reported client_bounds; fall back to find_color/find_text targeting",
-		Details: details,
-	}
+	return newDivergenceWarning(client, analysis)
 }
 
 // EstimateRenderedBounds returns a best-effort inner rectangle where
@@ -100,58 +117,173 @@ func EstimateRenderedBounds(info contract.WindowInfo) (contract.Bounds, bool) {
 	if client.Empty() || client.Width < divergenceProbeSize || client.Height < divergenceProbeSize {
 		return client, false
 	}
-	rootColor, ok := dominantRootColor(d)
-	if !ok {
-		return client, false
-	}
-	patch, _, ok := samplePatchAtCorner(d, client)
-	if !ok {
-		return client, false
-	}
-	matches := countColorMatches(patch, rootColor, divergenceMatchTolerance)
-	total := len(patch)
-	if total == 0 {
-		return client, false
-	}
-	if float64(matches)/float64(total) < divergenceMatchFraction {
-		// No divergence; rendered bounds == WM client bounds.
-		return client, false
-	}
-	return estimateRenderedBounds(d, client, rootColor), true
-}
-
-// dominantRootColor samples a small patch of exposed desktop one
-// divergenceProbeSize step to the left and above client_bounds-origin
-// is too risky because some WMs paint there. Instead we sample the
-// top-left corner of the root window — coordinate (0,0) — which is
-// reliably wallpaper on every WM that doesn't have a desktop manager
-// drawing widgets at the screen origin. Returns the median color of
-// the sampled patch so the dominant background dominates even when
-// the wallpaper has subtle gradients.
-func dominantRootColor(d *x11.Display) (color.RGBA, bool) {
-	// Sample at the screen origin first; if the patch shows an obvious
-	// non-uniform region (e.g., a desktop widget) fall back to the
-	// bottom-right corner of the root window.
 	screen := x11.ScreenBounds(d)
-	patch, _, ok := samplePatch(d, contract.Bounds{X: 0, Y: 0, Width: divergenceProbeSize, Height: divergenceProbeSize}, screen)
-	if !ok || len(patch) == 0 {
-		return color.RGBA{}, false
+	sampler := func(region contract.Bounds) ([]color.RGBA, contract.Bounds, bool) {
+		return samplePatch(d, region, screen)
 	}
-	return medianColor(patch), true
+	analysis, ok := analyzeGeometryDivergence(client, screen, sampler)
+	if !ok {
+		return client, false
+	}
+	return analysis.estimate, true
 }
 
-// samplePatchAtCorner samples a divergenceProbeSize patch anchored to
-// the bottom-right interior corner of the supplied client_bounds.
-// Returns the raw pixel slice plus the actual patch bounds (after
-// clamping to the screen).
-func samplePatchAtCorner(d *x11.Display, client contract.Bounds) ([]color.RGBA, contract.Bounds, bool) {
+func analyzeGeometryDivergence(client, screen contract.Bounds, sampler patchSampler) (*divergenceAnalysis, bool) {
+	if client.Empty() || client.Width < divergenceProbeSize || client.Height < divergenceProbeSize {
+		return nil, false
+	}
+	cornerPatch, cornerBounds, ok := samplePatchAtCornerWith(client, sampler)
+	if !ok || len(cornerPatch) == 0 {
+		return nil, false
+	}
+
+	var best *divergenceAnalysis
+	for _, bg := range desktopBackgroundCandidates(client, screen, sampler) {
+		fraction := patchMatchFraction(cornerPatch, bg.color)
+		if fraction < divergenceMatchFraction {
+			continue
+		}
+		analysis := &divergenceAnalysis{
+			background:       bg.color,
+			backgroundSource: bg.source,
+			backgroundRegion: bg.region,
+			probeRegion:      cornerBounds,
+			matchFraction:    fraction,
+			estimate:         estimateRenderedBoundsWithSampler(client, bg.color, sampler),
+		}
+		if best == nil || analysis.matchFraction > best.matchFraction {
+			best = analysis
+		}
+	}
+	if best != nil {
+		return best, true
+	}
+	return edgeConsensusDivergence(client, screen, sampler, cornerPatch, cornerBounds)
+}
+
+func newDivergenceWarning(client contract.Bounds, analysis *divergenceAnalysis) *VerbWarning {
+	probe := map[string]any{
+		"region":            analysis.probeRegion,
+		"match_fraction":    analysis.matchFraction,
+		"tolerance_px":      divergenceMatchTolerance,
+		"root_color":        formatRGB(analysis.background),
+		"background_color":  formatRGB(analysis.background),
+		"background_source": analysis.backgroundSource,
+	}
+	if !analysis.backgroundRegion.Empty() {
+		probe["background_region"] = analysis.backgroundRegion
+	}
+	if analysis.edgeProbes > 0 {
+		probe["edge_consensus"] = analysis.edgeConsensus
+		probe["edge_probes"] = analysis.edgeProbes
+		probe["anchor_match_fraction"] = analysis.anchorMatchFraction
+	}
+	details := map[string]any{
+		"wm_bounds":                client,
+		"rendered_bounds_estimate": analysis.estimate,
+		"probe":                    probe,
+		"suggestion":               "app may not be tracking ConfigureNotify; coordinate-based clicks at WM bounds may miss the rendered surface",
+	}
+	return &VerbWarning{
+		Code:    contract.WindowGeometryDivergedCode,
+		Message: "rendered surface appears smaller than WM-reported client_bounds; fall back to find_color/find_text targeting",
+		Details: details,
+	}
+}
+
+func desktopBackgroundCandidates(client, screen contract.Bounds, sampler patchSampler) []backgroundSample {
+	if screen.Empty() {
+		return nil
+	}
+	step := divergenceProbeSize
+	regions := []contract.Bounds{
+		{X: screen.X, Y: screen.Y, Width: step, Height: step},
+		{X: screen.X + screen.Width - step, Y: screen.Y, Width: step, Height: step},
+		{X: screen.X, Y: screen.Y + screen.Height - step, Width: step, Height: step},
+		{X: screen.X + screen.Width - step, Y: screen.Y + screen.Height - step, Width: step, Height: step},
+		{X: screen.X + (screen.Width-step)/2, Y: screen.Y, Width: step, Height: step},
+		{X: screen.X + (screen.Width-step)/2, Y: screen.Y + screen.Height - step, Width: step, Height: step},
+		{X: screen.X, Y: screen.Y + (screen.Height-step)/2, Width: step, Height: step},
+		{X: screen.X + screen.Width - step, Y: screen.Y + (screen.Height-step)/2, Width: step, Height: step},
+	}
+	var out []backgroundSample
+	for _, region := range uniqueProbeRegions(regions, screen) {
+		if rectsIntersect(region, client) {
+			continue
+		}
+		patch, actual, ok := sampler(region)
+		if !ok || len(patch) == 0 {
+			continue
+		}
+		out = append(out, backgroundSample{
+			color:  medianColor(patch),
+			region: actual,
+			source: "desktop_reference",
+		})
+	}
+	return out
+}
+
+func edgeConsensusDivergence(client, screen contract.Bounds, sampler patchSampler, cornerPatch []color.RGBA, cornerBounds contract.Bounds) (*divergenceAnalysis, bool) {
+	background := medianColor(cornerPatch)
+	regions := edgeProbeRegions(client, screen)
+	if len(regions) < divergenceEdgeConsensusMin {
+		return nil, false
+	}
+	consensus := 0
+	for _, region := range regions {
+		patch, _, ok := sampler(region)
+		if !ok || len(patch) == 0 {
+			continue
+		}
+		if patchMatchFraction(patch, background) >= divergenceMatchFraction {
+			consensus++
+		}
+	}
+	if consensus < divergenceEdgeConsensusMin {
+		return nil, false
+	}
+	anchorPatch, _, ok := sampler(contract.Bounds{X: client.X, Y: client.Y, Width: divergenceProbeSize, Height: divergenceProbeSize})
+	if !ok || len(anchorPatch) == 0 {
+		return nil, false
+	}
+	anchorFraction := patchMatchFraction(anchorPatch, background)
+	if anchorFraction >= divergenceAnchorMaxMatchFraction {
+		return nil, false
+	}
+	estimate := estimateRenderedBoundsWithSampler(client, background, sampler)
+	shrinkW := client.Width - estimate.Width
+	shrinkH := client.Height - estimate.Height
+	if shrinkW < divergenceMinFallbackShrinkPx || shrinkH < divergenceMinFallbackShrinkPx {
+		return nil, false
+	}
+	if estimate.Width < divergenceMinRenderedExtentPx || estimate.Height < divergenceMinRenderedExtentPx {
+		return nil, false
+	}
+	return &divergenceAnalysis{
+		background:          background,
+		backgroundSource:    "edge_consensus",
+		probeRegion:         cornerBounds,
+		matchFraction:       patchMatchFraction(cornerPatch, background),
+		edgeConsensus:       consensus,
+		edgeProbes:          len(regions),
+		anchorMatchFraction: anchorFraction,
+		estimate:            estimate,
+	}, true
+}
+
+// samplePatchAtCornerWith samples a divergenceProbeSize patch anchored to
+// the bottom-right interior corner of the supplied client_bounds via the
+// caller-supplied sampler. Returns the raw pixel slice plus the actual
+// patch bounds (after clamping to the screen).
+func samplePatchAtCornerWith(client contract.Bounds, sampler patchSampler) ([]color.RGBA, contract.Bounds, bool) {
 	patchBounds := contract.Bounds{
 		X:      client.X + client.Width - divergenceProbeSize,
 		Y:      client.Y + client.Height - divergenceProbeSize,
 		Width:  divergenceProbeSize,
 		Height: divergenceProbeSize,
 	}
-	return samplePatch(d, patchBounds, x11.ScreenBounds(d))
+	return sampler(patchBounds)
 }
 
 // samplePatch grabs a rectangle of root-window pixels and returns the
@@ -324,6 +456,49 @@ func countColorMatches(pixels []color.RGBA, ref color.RGBA, tolerance int) int {
 	return matches
 }
 
+func patchMatchFraction(pixels []color.RGBA, ref color.RGBA) float64 {
+	if len(pixels) == 0 {
+		return 0
+	}
+	return float64(countColorMatches(pixels, ref, divergenceMatchTolerance)) / float64(len(pixels))
+}
+
+func edgeProbeRegions(client, screen contract.Bounds) []contract.Bounds {
+	step := divergenceProbeSize
+	regions := []contract.Bounds{
+		{X: client.X + client.Width - step, Y: client.Y + client.Height - step, Width: step, Height: step},   // bottom-right
+		{X: client.X + client.Width - step, Y: client.Y, Width: step, Height: step},                          // top-right
+		{X: client.X, Y: client.Y + client.Height - step, Width: step, Height: step},                         // bottom-left
+		{X: client.X + client.Width - step, Y: client.Y + (client.Height-step)/2, Width: step, Height: step}, // right-middle
+		{X: client.X + (client.Width-step)/2, Y: client.Y + client.Height - step, Width: step, Height: step}, // bottom-middle
+	}
+	return uniqueProbeRegions(regions, screen)
+}
+
+func uniqueProbeRegions(regions []contract.Bounds, screen contract.Bounds) []contract.Bounds {
+	seen := map[contract.Bounds]bool{}
+	out := make([]contract.Bounds, 0, len(regions))
+	for _, region := range regions {
+		clamped := clampToScreen(region, screen)
+		if clamped.Empty() || seen[clamped] {
+			continue
+		}
+		seen[clamped] = true
+		out = append(out, clamped)
+	}
+	return out
+}
+
+func rectsIntersect(a, b contract.Bounds) bool {
+	if a.Empty() || b.Empty() {
+		return false
+	}
+	return a.X < b.X+b.Width &&
+		a.X+a.Width > b.X &&
+		a.Y < b.Y+b.Height &&
+		a.Y+a.Height > b.Y
+}
+
 func absDiff(a, b int) int {
 	if a > b {
 		return a - b
@@ -331,45 +506,39 @@ func absDiff(a, b int) int {
 	return b - a
 }
 
-// estimateRenderedBounds searches for the rectangle inside client_bounds
-// whose bottom-right corner stops matching the root color, giving the
-// agent a usable hint about the actual rendered surface size. Uses a
-// binary search along each axis independently (independent searches
-// keep total cost at O(log N) XGetImage calls per axis rather than the
-// O(N²) full grid that a true 2D search would need).
+// estimateRenderedBoundsWithSampler searches for a top-left anchored
+// rendered rectangle inside client_bounds. It looks along the top edge
+// for the width boundary and along the left edge for the height boundary
+// instead of probing only the bottom-right corner. That matters for the
+// stale Gio/ImGui failure mode: the entire bottom band can be exposed
+// desktop, so a bottom-row width search collapses to one probe even when
+// the old rendered surface is still visible in the top-left.
 //
 // The estimate snaps to multiples of divergenceProbeSize since that is
 // the sampling resolution. Returns the original client_bounds when the
 // search cannot narrow the rectangle (e.g., even a single-step shrink
-// still matches the root color — likely a window with NO rendered
+// still matches the background color — likely a window with NO rendered
 // surface at all).
-func estimateRenderedBounds(d *x11.Display, client contract.Bounds, rootColor color.RGBA) contract.Bounds {
+func estimateRenderedBoundsWithSampler(client contract.Bounds, background color.RGBA, sampler patchSampler) contract.Bounds {
 	step := divergenceProbeSize
 	rendered := client
-	screen := x11.ScreenBounds(d)
-	// Shrink width: find the largest w such that the patch at the inner
-	// bottom-right corner of a rectangle (origin, w, client.Height)
-	// stops matching the root color.
+	// Shrink width: find the largest w whose top-edge patch still looks
+	// like rendered content rather than exposed background.
 	if client.Width > step {
 		lo, hi := step, client.Width
-		// First confirm the corner at full width matches (it must, since
-		// we only reach this path after detectGeometryDivergence flagged
-		// the window). Then binary-search the boundary.
 		for lo < hi {
 			mid := (lo + hi + 1) / 2
 			region := contract.Bounds{
 				X:      client.X + mid - step,
-				Y:      client.Y + client.Height - step,
+				Y:      client.Y,
 				Width:  step,
 				Height: step,
 			}
-			patch, _, ok := samplePatch(d, region, screen)
-			if !ok {
+			patch, _, ok := sampler(region)
+			if !ok || len(patch) == 0 {
 				break
 			}
-			matches := countColorMatches(patch, rootColor, divergenceMatchTolerance)
-			fraction := float64(matches) / float64(len(patch))
-			if fraction >= divergenceMatchFraction {
+			if patchMatchFraction(patch, background) >= divergenceMatchFraction {
 				// Inside the exposed-desktop band; rendered surface is
 				// narrower than `mid`.
 				hi = mid - 1
@@ -383,24 +552,22 @@ func estimateRenderedBounds(d *x11.Display, client contract.Bounds, rootColor co
 			rendered.Width = lo
 		}
 	}
-	// Shrink height the same way using the (now-narrowed) width.
+	// Shrink height the same way down the left edge.
 	if client.Height > step {
 		lo, hi := step, client.Height
 		for lo < hi {
 			mid := (lo + hi + 1) / 2
 			region := contract.Bounds{
-				X:      client.X + rendered.Width - step,
+				X:      client.X,
 				Y:      client.Y + mid - step,
 				Width:  step,
 				Height: step,
 			}
-			patch, _, ok := samplePatch(d, region, screen)
-			if !ok {
+			patch, _, ok := sampler(region)
+			if !ok || len(patch) == 0 {
 				break
 			}
-			matches := countColorMatches(patch, rootColor, divergenceMatchTolerance)
-			fraction := float64(matches) / float64(len(patch))
-			if fraction >= divergenceMatchFraction {
+			if patchMatchFraction(patch, background) >= divergenceMatchFraction {
 				hi = mid - 1
 			} else {
 				lo = mid
