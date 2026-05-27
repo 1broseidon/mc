@@ -14,6 +14,40 @@ in `anvil.md` for the rule.
 
 ## [Unreleased]
 
+## [0.3.2] — 2026-05-27
+
+Review-agent patch. A second-pass agent review found that the v0.3.1
+fixes had three sharp edges remaining. v0.3.2 closes them.
+
+### Changed
+
+- `internal/x11`: hoist `MaybeAutoDetectDisplay()` into the x11 package
+  so `mcpserver.New()` runs the same auto-probe used by the CLI doctor
+  path. MCP hosts launched from non-X-aware parents now get `DISPLAY`
+  without any host-side change.
+- `internal/mcpserver`: MCP tool errors serialize as `IsError: true`
+  tool results carrying `contract.MarshalError` JSON (instead of raw
+  transport errors that lost the structured envelope). Agents receive
+  the canonical `{error: {code, message, details}}` shape they can
+  parse.
+- `internal/image/find.go`: OCR output filenames now allocate a unique
+  per-invocation temp directory via `os.MkdirTemp`, fixing a race when
+  two `find_text` calls landed on the same screenshot pre-image
+  filename in parallel.
+- `internal/image/find.go`: smart-PSM auto-retry now also covers the
+  defensible `OUTPUT_MISSING` case — Tesseract sometimes drops its TSV
+  output on tight sparse regions; the retry path now catches that and
+  re-runs with `psm=11`.
+- `internal/window/divergence.go`: don't trust root `(0,0)` as the
+  desktop reference (some setups put a panel there). Sample outside the
+  client rectangle when room exists; fall back to multi-edge consensus
+  for fullscreen windows where no outside-desktop sample is available.
+
+### Schema versions
+
+- `schema_version` remains `"0.2"`. Supported list: `["0.2", "0.1"]`.
+  No wire-shape mutations in v0.3.2.
+
 ## [0.3.1] — 2026-05-26
 
 Codex-dogfood patch. An external agent (Codex) loaded the skill via
