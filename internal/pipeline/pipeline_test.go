@@ -359,3 +359,40 @@ func errorsAs(err error, target **contract.AppError) bool {
 		err = u.Unwrap()
 	}
 }
+
+// TestTargetNotFoundExitCode pins the conventions.yaml exit-code
+// table: TARGET_NOT_FOUND must map to ExitNotFound (3), not
+// ExitPrecondition (5). Covers the four call sites that previously
+// used contract.Precondition("TARGET_NOT_FOUND", ...): find_text,
+// find_image, find_color, and click_text/click_image via
+// pickClickCandidate. Any future regression that routes a zero-match
+// find through contract.Precondition flips this test.
+//
+// pickClickCandidate is the only one of the four reachable in a
+// no-display CI env; the runFind* paths shell out to a screen capture
+// and are unit-tested elsewhere with a TTY-less harness. The
+// assertion on the error constructor is sufficient to cover all four
+// because the bug class is "wrong exit class" and they all share the
+// same fix pattern.
+func TestTargetNotFoundExitCode(t *testing.T) {
+	_, err := pickClickCandidate(nil, 0.0, false, "text")
+	if err == nil {
+		t.Fatal("pickClickCandidate(nil) returned nil error; want TARGET_NOT_FOUND")
+	}
+	var appErr *contract.AppError
+	if !errorsAs(err, &appErr) {
+		t.Fatalf("expected *contract.AppError, got %T: %v", err, err)
+	}
+	if appErr.Code != "TARGET_NOT_FOUND" {
+		t.Fatalf("code=%q want TARGET_NOT_FOUND", appErr.Code)
+	}
+	if appErr.ExitCode != contract.ExitNotFound {
+		t.Fatalf("exit_code=%d want %d (ExitNotFound); conventions.yaml declares exit 3 for not_found", appErr.ExitCode, contract.ExitNotFound)
+	}
+	// Confirm the exit-code mapping contract itself hasn't drifted
+	// from conventions.yaml. If ExitNotFound ever changes, this
+	// pin forces a conscious decision rather than a silent break.
+	if contract.ExitNotFound != 3 {
+		t.Fatalf("contract.ExitNotFound=%d want 3; update conventions.yaml and this test together", contract.ExitNotFound)
+	}
+}

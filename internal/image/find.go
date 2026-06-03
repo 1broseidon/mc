@@ -184,7 +184,7 @@ const smartRetryPSM = 11
 //
 // Errors:
 //   - DEPENDENCY_UNAVAILABLE (exit 4): tesseract binary missing.
-//   - TARGET_NOT_FOUND (exit 5): zero candidates matched the query.
+//   - TARGET_NOT_FOUND (exit 3): zero candidates matched the query.
 func FindText(ctx context.Context, batch *BatchContext, region contract.Bounds, img *image.RGBA, req FindTextRequest) (contract.FindResult, error) {
 	if req.Query == "" {
 		return contract.FindResult{}, contract.Validation("QUERY_REQUIRED", "find_text requires a query", nil)

@@ -1068,7 +1068,7 @@ func runFindText(ctx context.Context, bctx *imageutil.BatchContext, action Actio
 	}
 	annotateFindClamp(&result, regionRes)
 	if len(result.Candidates) == 0 {
-		return result, contract.Precondition("TARGET_NOT_FOUND", "find_text returned no candidates", map[string]any{"query": action.Query, "region": capture})
+		return result, contract.NotFound("TARGET_NOT_FOUND", "find_text returned no candidates", map[string]any{"query": action.Query, "region": capture})
 	}
 	return result, nil
 }
@@ -1093,7 +1093,7 @@ func runFindImage(ctx context.Context, action Action) (contract.FindResult, erro
 	}
 	annotateFindClamp(&result, regionRes)
 	if len(result.Candidates) == 0 {
-		return result, contract.Precondition("TARGET_NOT_FOUND", "find_image returned no candidates", map[string]any{"template_path": action.TemplatePath, "region": capture})
+		return result, contract.NotFound("TARGET_NOT_FOUND", "find_image returned no candidates", map[string]any{"template_path": action.TemplatePath, "region": capture})
 	}
 	return result, nil
 }
@@ -1123,7 +1123,7 @@ func runFindColor(ctx context.Context, action Action) (contract.FindResult, erro
 	}
 	annotateFindClamp(&result, regionRes)
 	if len(result.Candidates) == 0 {
-		return result, contract.Precondition("TARGET_NOT_FOUND", "find_color returned no candidates", map[string]any{"color": action.Color, "region": capture})
+		return result, contract.NotFound("TARGET_NOT_FOUND", "find_color returned no candidates", map[string]any{"color": action.Color, "region": capture})
 	}
 	return result, nil
 }
@@ -1198,7 +1198,7 @@ func applyTextClampDetails(details map[string]any, res wait.TextResult) {
 
 func pickClickCandidate(cands []contract.FindCandidate, minConf float64, strict bool, what string) (contract.FindCandidate, error) {
 	if len(cands) == 0 {
-		return contract.FindCandidate{}, contract.Precondition("TARGET_NOT_FOUND", "click target not found", map[string]any{"what": what})
+		return contract.FindCandidate{}, contract.NotFound("TARGET_NOT_FOUND", "click target not found", map[string]any{"what": what})
 	}
 	if strict {
 		var passing []contract.FindCandidate
