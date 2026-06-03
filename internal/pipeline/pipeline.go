@@ -659,7 +659,7 @@ func dispatchAction(ctx context.Context, batch ActionBatch, action Action, idx i
 		if err != nil {
 			return rec, contract.ActionResult{}, err
 		}
-		return rec, contract.ActionResult{Action: action.Type, OK: true, Backend: "x11.EWMH", Details: map[string]any{"window": win}}, nil
+		return rec, contract.ActionResult{Action: action.Type, OK: true, Backend: platform.Current().Labels().Window, Details: map[string]any{"window": win}}, nil
 	case "move_mouse", "move":
 		point, err := resolvePoint(action.Point, action.TargetSlot, bctx)
 		if err != nil {
@@ -668,7 +668,7 @@ func dispatchAction(ctx context.Context, batch ActionBatch, action Action, idx i
 		if err := input.Move(ctx, point); err != nil {
 			return rec, contract.ActionResult{}, err
 		}
-		return rec, contract.ActionResult{Action: action.Type, OK: true, Backend: "XTest"}, nil
+		return rec, contract.ActionResult{Action: action.Type, OK: true, Backend: platform.Current().Labels().Input}, nil
 	case "click":
 		point, err := resolvePoint(action.Point, action.TargetSlot, bctx)
 		if err != nil {
@@ -677,7 +677,7 @@ func dispatchAction(ctx context.Context, batch ActionBatch, action Action, idx i
 		if err := input.Click(ctx, input.ClickRequest{Point: point, Button: action.Button, Count: action.Count}); err != nil {
 			return rec, contract.ActionResult{}, err
 		}
-		return rec, contract.ActionResult{Action: action.Type, OK: true, Backend: "XTest"}, nil
+		return rec, contract.ActionResult{Action: action.Type, OK: true, Backend: platform.Current().Labels().Input}, nil
 	case "double_click":
 		point, err := resolvePoint(action.Point, action.TargetSlot, bctx)
 		if err != nil {
@@ -686,17 +686,17 @@ func dispatchAction(ctx context.Context, batch ActionBatch, action Action, idx i
 		if err := input.Click(ctx, input.ClickRequest{Point: point, Button: action.Button, Count: 2}); err != nil {
 			return rec, contract.ActionResult{}, err
 		}
-		return rec, contract.ActionResult{Action: action.Type, OK: true, Backend: "XTest"}, nil
+		return rec, contract.ActionResult{Action: action.Type, OK: true, Backend: platform.Current().Labels().Input}, nil
 	case "drag":
 		if err := input.Drag(ctx, input.DragRequest{From: action.From, To: action.To, Button: action.Button, DurationMS: action.DurationMS}); err != nil {
 			return rec, contract.ActionResult{}, err
 		}
-		return rec, contract.ActionResult{Action: action.Type, OK: true, Backend: "XTest"}, nil
+		return rec, contract.ActionResult{Action: action.Type, OK: true, Backend: platform.Current().Labels().Input}, nil
 	case "scroll":
 		if err := input.Scroll(ctx, input.ScrollRequest{Point: action.Point, Direction: action.Direction, Amount: action.Amount}); err != nil {
 			return rec, contract.ActionResult{}, err
 		}
-		return rec, contract.ActionResult{Action: action.Type, OK: true, Backend: "XTest"}, nil
+		return rec, contract.ActionResult{Action: action.Type, OK: true, Backend: platform.Current().Labels().Input}, nil
 	case "type_text":
 		res, err := input.TypeTextWith(ctx, input.TypeTextRequest{Text: action.Text, Via: action.Via})
 		if err != nil {
@@ -712,9 +712,9 @@ func dispatchAction(ctx context.Context, batch ActionBatch, action Action, idx i
 				details["ime_engine"] = res.IMEEngine
 			}
 		}
-		backend := "XTest"
+		backend := platform.Current().Labels().Input
 		if res.Via == input.TypeTextViaPaste {
-			backend = "x11.clipboard"
+			backend = platform.Current().Labels().Clipboard
 		}
 		return rec, contract.ActionResult{Action: action.Type, OK: true, Backend: backend, Details: details}, nil
 	case "clipboard_read":
@@ -728,7 +728,7 @@ func dispatchAction(ctx context.Context, batch ActionBatch, action Action, idx i
 			return rec, contract.ActionResult{}, err
 		}
 		rec.Clipboard = &audit.ClipboardSummary{Selection: r.Selection, Mime: r.Mime, Bytes: r.Bytes}
-		return rec, contract.ActionResult{Action: action.Type, OK: true, Backend: "x11.clipboard", Details: map[string]any{
+		return rec, contract.ActionResult{Action: action.Type, OK: true, Backend: platform.Current().Labels().Clipboard, Details: map[string]any{
 			"content":   r.Content,
 			"mime":      r.Mime,
 			"selection": r.Selection,
@@ -742,7 +742,7 @@ func dispatchAction(ctx context.Context, batch ActionBatch, action Action, idx i
 		// Audit redaction: bytes + mime + selection only — content
 		// must NEVER appear in the audit log (see task-6 contract).
 		rec.Clipboard = &audit.ClipboardSummary{Selection: w.Selection, Mime: w.Mime, Bytes: w.Bytes}
-		return rec, contract.ActionResult{Action: action.Type, OK: true, Backend: "x11.clipboard", Details: map[string]any{
+		return rec, contract.ActionResult{Action: action.Type, OK: true, Backend: platform.Current().Labels().Clipboard, Details: map[string]any{
 			"selection": w.Selection,
 			"mime":      w.Mime,
 			"bytes":     w.Bytes,
@@ -767,12 +767,12 @@ func dispatchAction(ctx context.Context, batch ActionBatch, action Action, idx i
 		if err := input.PressKey(ctx, chord); err != nil {
 			return rec, contract.ActionResult{}, err
 		}
-		return rec, contract.ActionResult{Action: action.Type, OK: true, Backend: "XTest", Details: map[string]any{"method": method, "chord": chord}}, nil
+		return rec, contract.ActionResult{Action: action.Type, OK: true, Backend: platform.Current().Labels().Input, Details: map[string]any{"method": method, "chord": chord}}, nil
 	case "press_key":
 		if err := input.PressKey(ctx, action.Key); err != nil {
 			return rec, contract.ActionResult{}, err
 		}
-		return rec, contract.ActionResult{Action: action.Type, OK: true, Backend: "XTest"}, nil
+		return rec, contract.ActionResult{Action: action.Type, OK: true, Backend: platform.Current().Labels().Input}, nil
 	case "set_text":
 		if action.ElementID == "" {
 			return rec, contract.ActionResult{}, contract.Validation("ELEMENT_ID_REQUIRED", "set_text requires an AT-SPI element_id", nil)
@@ -780,7 +780,7 @@ func dispatchAction(ctx context.Context, batch ActionBatch, action Action, idx i
 		if err := a11y.SetText(ctx, action.ElementID, action.Text); err != nil {
 			return rec, contract.ActionResult{}, err
 		}
-		return rec, contract.ActionResult{Action: action.Type, OK: true, Backend: "at-spi"}, nil
+		return rec, contract.ActionResult{Action: action.Type, OK: true, Backend: platform.Current().Labels().Accessibility}, nil
 	case "perform_action":
 		if action.ElementID == "" {
 			return rec, contract.ActionResult{}, contract.Validation("ELEMENT_ID_REQUIRED", "perform_action requires an AT-SPI element_id", nil)
@@ -788,7 +788,7 @@ func dispatchAction(ctx context.Context, batch ActionBatch, action Action, idx i
 		if err := a11y.PerformAction(ctx, action.ElementID, action.Action); err != nil {
 			return rec, contract.ActionResult{}, err
 		}
-		return rec, contract.ActionResult{Action: action.Type, OK: true, Backend: "at-spi"}, nil
+		return rec, contract.ActionResult{Action: action.Type, OK: true, Backend: platform.Current().Labels().Accessibility}, nil
 	case "wait":
 		duration := time.Duration(action.DurationMS) * time.Millisecond
 		if duration <= 0 {
@@ -870,7 +870,7 @@ func dispatchAction(ctx context.Context, batch ActionBatch, action Action, idx i
 		if err := input.Click(ctx, input.ClickRequest{Point: click, Button: action.Button, Count: max1(action.Count)}); err != nil {
 			return rec, contract.ActionResult{}, err
 		}
-		return rec, contract.ActionResult{Action: action.Type, OK: true, Backend: "XTest", Details: map[string]any{"matched": cand}}, nil
+		return rec, contract.ActionResult{Action: action.Type, OK: true, Backend: platform.Current().Labels().Input, Details: map[string]any{"matched": cand}}, nil
 	case "click_image":
 		// Hybrid: same dry-run semantics as click_text.
 		result, err := runFindImage(ctx, action)
@@ -894,7 +894,7 @@ func dispatchAction(ctx context.Context, batch ActionBatch, action Action, idx i
 		if err := input.Click(ctx, input.ClickRequest{Point: click, Button: action.Button, Count: max1(action.Count)}); err != nil {
 			return rec, contract.ActionResult{}, err
 		}
-		return rec, contract.ActionResult{Action: action.Type, OK: true, Backend: "XTest", Details: map[string]any{"matched": cand}}, nil
+		return rec, contract.ActionResult{Action: action.Type, OK: true, Backend: platform.Current().Labels().Input, Details: map[string]any{"matched": cand}}, nil
 	case "window_move":
 		res, err := window.Move(ctx, window.MoveRequest{Target: action.Target, X: action.X, Y: action.Y})
 		if err != nil {
@@ -954,7 +954,7 @@ func dispatchAction(ctx context.Context, batch ActionBatch, action Action, idx i
 		return rec, contract.ActionResult{
 			Action:  action.Type,
 			OK:      true,
-			Backend: "x11.EWMH",
+			Backend: platform.Current().Labels().Window,
 			Details: map[string]any{
 				"matched":    res.Matched,
 				"polls":      res.Polls,
@@ -985,7 +985,7 @@ func dispatchAction(ctx context.Context, batch ActionBatch, action Action, idx i
 		return rec, contract.ActionResult{
 			Action:  action.Type,
 			OK:      true,
-			Backend: "x11.GetImage",
+			Backend: platform.Current().Labels().Capture,
 			Details: details,
 		}, nil
 	case "wait_for_text":
@@ -1263,7 +1263,7 @@ func windowActionResult(action string, res window.VerbResult) contract.ActionRes
 	if len(res.Notes) > 0 {
 		details["notes"] = res.Notes
 	}
-	return contract.ActionResult{Action: action, OK: true, Backend: "x11.EWMH", Details: details}
+	return contract.ActionResult{Action: action, OK: true, Backend: platform.Current().Labels().Window, Details: details}
 }
 
 func max1(n int) int {
@@ -1328,7 +1328,7 @@ func RunClickText(ctx context.Context, action Action) (contract.ActionResult, er
 	if err := input.Click(ctx, input.ClickRequest{Point: centerOf(cand), Button: action.Button, Count: max1(action.Count)}); err != nil {
 		return contract.ActionResult{Action: "click_text", OK: false}, err
 	}
-	return contract.ActionResult{Action: "click_text", OK: true, Backend: "XTest", Details: map[string]any{"matched": cand}}, nil
+	return contract.ActionResult{Action: "click_text", OK: true, Backend: platform.Current().Labels().Input, Details: map[string]any{"matched": cand}}, nil
 }
 
 // RunClickImage composes find_image + click on the highest-confidence
@@ -1345,7 +1345,7 @@ func RunClickImage(ctx context.Context, action Action) (contract.ActionResult, e
 	if err := input.Click(ctx, input.ClickRequest{Point: centerOf(cand), Button: action.Button, Count: max1(action.Count)}); err != nil {
 		return contract.ActionResult{Action: "click_image", OK: false}, err
 	}
-	return contract.ActionResult{Action: "click_image", OK: true, Backend: "XTest", Details: map[string]any{"matched": cand}}, nil
+	return contract.ActionResult{Action: "click_image", OK: true, Backend: platform.Current().Labels().Input, Details: map[string]any{"matched": cand}}, nil
 }
 
 func Observe(ctx context.Context, includeScreenshot bool) (contract.ObserveResult, error) {
@@ -1373,9 +1373,9 @@ func Observe(ctx context.Context, includeScreenshot bool) (contract.ObserveResul
 		Cursor:        cursor,
 		Accessibility: tree,
 		Backends: map[string]string{
-			"screen": "x11",
-			"window": "EWMH",
-			"input":  "XTest",
+			"screen": platform.Current().Labels().Screen,
+			"window": platform.Current().Labels().Window,
+			"input":  platform.Current().Labels().Input,
 		},
 	}
 	if includeScreenshot {

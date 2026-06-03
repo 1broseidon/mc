@@ -13,7 +13,7 @@ func newWindowsCommand() *cobra.Command {
 	var detectRendered bool
 	cmd := &cobra.Command{
 		Use:   "windows",
-		Short: "List X11 top-level windows",
+		Short: "List top-level windows",
 		Example: `  mycomputer windows
   mycomputer windows --json
   mycomputer windows --minimal

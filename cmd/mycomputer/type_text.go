@@ -7,6 +7,7 @@ import (
 
 	"github.com/1broseidon/mc/internal/contract"
 	"github.com/1broseidon/mc/internal/input"
+	"github.com/1broseidon/mc/internal/platform"
 )
 
 // newTypeTextCommand exposes the upgraded TypeText routing via the CLI.
@@ -53,7 +54,7 @@ func newTypeTextCommand() *cobra.Command {
 
 func backendForVia(via string) string {
 	if via == input.TypeTextViaPaste {
-		return "x11.clipboard"
+		return platform.Current().Labels().Clipboard
 	}
-	return "XTest"
+	return platform.Current().Labels().Input
 }

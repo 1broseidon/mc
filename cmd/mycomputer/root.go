@@ -34,8 +34,8 @@ func execute() error {
 func newRootCommand() *cobra.Command {
 	root := &cobra.Command{
 		Use:           "mycomputer",
-		Short:         "Go-native X11 computer use for Linux agents",
-		Long:          "MyComputer is a local CLI and MCP server for X11 desktop computer use on Linux.",
+		Short:         "Go-native desktop computer use for agents",
+		Long:          "MyComputer is a local CLI and MCP server for desktop computer use.",
 		SilenceUsage:  true,
 		SilenceErrors: true,
 	}

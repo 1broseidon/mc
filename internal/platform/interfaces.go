@@ -191,6 +191,9 @@ type Provider interface {
 	// Name identifies the active backend for diagnostics (e.g. "x11",
 	// "darwin", "unsupported").
 	Name() string
+	// Labels returns stable user-facing backend labels for action results
+	// and observe summaries.
+	Labels() BackendLabels
 
 	Pointer() Pointer
 	Keyboard() Keyboard

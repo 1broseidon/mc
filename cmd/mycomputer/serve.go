@@ -36,6 +36,6 @@ func newServeCommand() *cobra.Command {
 			return server.Run(cmd.Context(), &mcp.StdioTransport{})
 		},
 	}
-	cmd.Flags().StringVar(&displayOverride, "display", "", "explicit X11 DISPLAY value (e.g. :0, :1) for MCP hosts that don't propagate DISPLAY")
+	cmd.Flags().StringVar(&displayOverride, "display", "", "explicit display value (e.g. :0, :1) for MCP hosts that don't propagate DISPLAY")
 	return cmd
 }

@@ -102,7 +102,7 @@ func Info(ctx context.Context) (contract.ScreenInfo, error) {
 	}
 	info := contract.ScreenInfo{
 		Bounds:   bounds,
-		Backend:  platform.Current().Name(),
+		Backend:  platform.Current().Labels().Screen,
 		Monitors: monitors,
 	}
 	if len(info.Monitors) == 0 {
@@ -283,7 +283,7 @@ func Capture(ctx context.Context, req CaptureRequest) (contract.ScreenshotResult
 		CaptureBounds: capture,
 		ImageSize:     size,
 		CoordMap:      contract.NewCoordMap(capture, size).String(),
-		Backend:       platform.Current().Name() + ".capture",
+		Backend:       platform.Current().Labels().Capture,
 	}
 	if resolveRes.Clamped {
 		orig := resolveRes.OriginalRegion

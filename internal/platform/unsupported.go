@@ -24,6 +24,17 @@ func unsupportedErr(op string) error {
 }
 
 func (unsupported) Name() string { return "unsupported" }
+func (unsupported) Labels() BackendLabels {
+	return BackendLabels{
+		Platform:      "unsupported",
+		Screen:        "unsupported",
+		Capture:       "unsupported.capture",
+		Window:        "unsupported.window",
+		Input:         "unsupported.input",
+		Clipboard:     "unsupported.clipboard",
+		Accessibility: "unsupported.accessibility",
+	}
+}
 
 func (u unsupported) Pointer() Pointer       { return u }
 func (u unsupported) Keyboard() Keyboard     { return u }

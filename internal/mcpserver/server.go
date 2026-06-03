@@ -90,7 +90,7 @@ func New(opts Options) *mcp.Server {
 	if detector, ok := platform.Current().(platform.DisplayAutoDetector); ok {
 		detector.MaybeAutoDetectDisplay()
 	}
-	instructions := "MyComputer drives an X11 desktop for agents. computer_actions payloads require schema_version=\"" +
+	instructions := "MyComputer drives a desktop for agents. computer_actions payloads require schema_version=\"" +
 		contract.SchemaVersion + "\". Supported schema_versions: " +
 		strings.Join(contract.SupportedSchemaVersions(), ", ") + "."
 	s := mcp.NewServer(
@@ -113,7 +113,7 @@ func New(opts Options) *mcp.Server {
 		}
 		return nil, diagnostic.Doctor(opts.Version, opts.Config, toolNames), nil
 	})
-	add(s, "get_screen_info", "Return X11 screen dimensions, monitor bounds, and coordinate space.", true, false, func(ctx context.Context, _ *mcp.CallToolRequest, _ struct{}) (*mcp.CallToolResult, contract.ScreenInfo, error) {
+	add(s, "get_screen_info", "Return screen dimensions, monitor bounds, and coordinate space.", true, false, func(ctx context.Context, _ *mcp.CallToolRequest, _ struct{}) (*mcp.CallToolResult, contract.ScreenInfo, error) {
 		out, err := screen.Info(ctx)
 		return nil, out, err
 	})
@@ -150,25 +150,25 @@ func New(opts Options) *mcp.Server {
 	})
 	add(s, "move_mouse", "Move the pointer to a physical or screenshot-mapped coordinate.", false, true, func(ctx context.Context, _ *mcp.CallToolRequest, in contract.Point) (*mcp.CallToolResult, contract.ActionResult, error) {
 		err := input.Move(ctx, in)
-		return nil, contract.ActionResult{Action: "move_mouse", OK: err == nil, Backend: "XTest"}, err
+		return nil, contract.ActionResult{Action: "move_mouse", OK: err == nil, Backend: platform.Current().Labels().Input}, err
 	})
 	add(s, "click", "Click by coordinate with left, middle, or right button.", false, true, func(ctx context.Context, _ *mcp.CallToolRequest, in input.ClickRequest) (*mcp.CallToolResult, contract.ActionResult, error) {
 		err := input.Click(ctx, in)
-		return nil, contract.ActionResult{Action: "click", OK: err == nil, Backend: "XTest"}, err
+		return nil, contract.ActionResult{Action: "click", OK: err == nil, Backend: platform.Current().Labels().Input}, err
 	})
 	add(s, "drag", "Drag from one coordinate to another.", false, true, func(ctx context.Context, _ *mcp.CallToolRequest, in input.DragRequest) (*mcp.CallToolResult, contract.ActionResult, error) {
 		err := input.Drag(ctx, in)
-		return nil, contract.ActionResult{Action: "drag", OK: err == nil, Backend: "XTest"}, err
+		return nil, contract.ActionResult{Action: "drag", OK: err == nil, Backend: platform.Current().Labels().Input}, err
 	})
 	add(s, "scroll", "Scroll vertically or horizontally at a coordinate.", false, true, func(ctx context.Context, _ *mcp.CallToolRequest, in input.ScrollRequest) (*mcp.CallToolResult, contract.ActionResult, error) {
 		err := input.Scroll(ctx, in)
-		return nil, contract.ActionResult{Action: "scroll", OK: err == nil, Backend: "XTest"}, err
+		return nil, contract.ActionResult{Action: "scroll", OK: err == nil, Backend: platform.Current().Labels().Input}, err
 	})
-	add(s, "type_text", "Type literal text into the focused target. via:auto (default) picks paste for len>64 or non-ASCII or control chars; otherwise xtest. via:xtest is layout-aware (refuses INPUT_LAYOUT_UNREACHABLE chars). via:paste saves+writes+ctrl+v+restores clipboard. With an active IME, xtest is rejected with INPUT_IME_ACTIVE; auto silently routes to paste.", false, true, func(ctx context.Context, _ *mcp.CallToolRequest, in TypeTextInput) (*mcp.CallToolResult, contract.ActionResult, error) {
+	add(s, "type_text", "Type literal text into the focused target. via:auto (default) picks paste for len>64 or non-ASCII or control chars; otherwise keyboard injection. via:xtest uses the native key-injection backend and may refuse INPUT_LAYOUT_UNREACHABLE chars. via:paste saves+writes+ctrl+v+restores clipboard. With an active IME, direct key injection is rejected with INPUT_IME_ACTIVE; auto silently routes to paste.", false, true, func(ctx context.Context, _ *mcp.CallToolRequest, in TypeTextInput) (*mcp.CallToolResult, contract.ActionResult, error) {
 		res, err := input.TypeTextWith(ctx, input.TypeTextRequest{Text: in.Text, Via: in.Via})
-		backend := "XTest"
+		backend := platform.Current().Labels().Input
 		if res.Via == input.TypeTextViaPaste {
-			backend = "x11.clipboard"
+			backend = platform.Current().Labels().Clipboard
 		}
 		details := map[string]any{"via": res.Via}
 		if res.Via == input.TypeTextViaPaste {
@@ -182,11 +182,11 @@ func New(opts Options) *mcp.Server {
 		}
 		return nil, contract.ActionResult{Action: "type_text", OK: err == nil, Backend: backend, Details: details}, err
 	})
-	add(s, "clipboard_read", "Read the current value of an X11 selection (clipboard or primary) via native selection protocol.", true, false, func(ctx context.Context, _ *mcp.CallToolRequest, in ClipboardReadInput) (*mcp.CallToolResult, clipboard.ReadResult, error) {
+	add(s, "clipboard_read", "Read the current value of a clipboard selection (clipboard or primary) via native selection protocol.", true, false, func(ctx context.Context, _ *mcp.CallToolRequest, in ClipboardReadInput) (*mcp.CallToolResult, clipboard.ReadResult, error) {
 		out, err := clipboard.Read(ctx, in.Selection, in.Mime)
 		return nil, out, err
 	})
-	add(s, "clipboard_write", "Write content to an X11 selection (clipboard, primary, or both). MIME may be text/plain (default) or text/uri-list. Ownership is held by the MyComputer process for its lifetime.", false, true, func(ctx context.Context, _ *mcp.CallToolRequest, in ClipboardWriteInput) (*mcp.CallToolResult, clipboard.WriteResult, error) {
+	add(s, "clipboard_write", "Write content to a clipboard selection (clipboard, primary, or both). MIME may be text/plain (default) or text/uri-list. Ownership is held by the MyComputer process for its lifetime.", false, true, func(ctx context.Context, _ *mcp.CallToolRequest, in ClipboardWriteInput) (*mcp.CallToolResult, clipboard.WriteResult, error) {
 		out, err := clipboard.Write(ctx, in.Selection, in.Content, in.Mime)
 		return nil, out, err
 	})
@@ -203,34 +203,34 @@ func New(opts Options) *mcp.Server {
 			chord = "shift+insert"
 		default:
 			err := contract.Validation("PASTE_METHOD_INVALID", "paste method must be key or insert", map[string]any{"method": method})
-			return nil, contract.ActionResult{Action: "paste", OK: false, Backend: "XTest"}, err
+			return nil, contract.ActionResult{Action: "paste", OK: false, Backend: platform.Current().Labels().Input}, err
 		}
 		if in.Selection != "" && in.Selection != clipboard.SelectionClipboard {
 			err := contract.Validation("CLIPBOARD_SELECTION_INVALID", "paste only supports the clipboard selection", map[string]any{"selection": in.Selection})
-			return nil, contract.ActionResult{Action: "paste", OK: false, Backend: "XTest"}, err
+			return nil, contract.ActionResult{Action: "paste", OK: false, Backend: platform.Current().Labels().Input}, err
 		}
 		err := input.PressKey(ctx, chord)
-		return nil, contract.ActionResult{Action: "paste", OK: err == nil, Backend: "XTest", Details: map[string]any{"method": method, "chord": chord}}, err
+		return nil, contract.ActionResult{Action: "paste", OK: err == nil, Backend: platform.Current().Labels().Input, Details: map[string]any{"method": method, "chord": chord}}, err
 	})
 	add(s, "press_key", "Press a key or key chord such as enter, ctrl+l, or alt+tab.", false, true, func(ctx context.Context, _ *mcp.CallToolRequest, in KeyInput) (*mcp.CallToolResult, contract.ActionResult, error) {
 		err := input.PressKey(ctx, in.Key)
-		return nil, contract.ActionResult{Action: "press_key", OK: err == nil, Backend: "XTest"}, err
+		return nil, contract.ActionResult{Action: "press_key", OK: err == nil, Backend: platform.Current().Labels().Input}, err
 	})
-	add(s, "set_text", "Set element text through AT-SPI when available.", false, true, func(ctx context.Context, _ *mcp.CallToolRequest, in TextInput) (*mcp.CallToolResult, contract.ActionResult, error) {
+	add(s, "set_text", "Set element text through accessibility when available.", false, true, func(ctx context.Context, _ *mcp.CallToolRequest, in TextInput) (*mcp.CallToolResult, contract.ActionResult, error) {
 		if in.ElementID == "" {
-			err := contract.Validation("ELEMENT_ID_REQUIRED", "set_text requires an AT-SPI element_id", nil)
-			return nil, contract.ActionResult{Action: "set_text", OK: false, Backend: "at-spi"}, err
+			err := contract.Validation("ELEMENT_ID_REQUIRED", "set_text requires an accessibility element_id", nil)
+			return nil, contract.ActionResult{Action: "set_text", OK: false, Backend: platform.Current().Labels().Accessibility}, err
 		}
 		err := a11y.SetText(ctx, in.ElementID, in.Text)
-		return nil, contract.ActionResult{Action: "set_text", OK: err == nil, Backend: "at-spi"}, err
+		return nil, contract.ActionResult{Action: "set_text", OK: err == nil, Backend: platform.Current().Labels().Accessibility}, err
 	})
-	add(s, "perform_action", "Invoke an AT-SPI semantic action when available.", false, true, func(ctx context.Context, _ *mcp.CallToolRequest, in SemanticActionInput) (*mcp.CallToolResult, contract.ActionResult, error) {
+	add(s, "perform_action", "Invoke a semantic accessibility action when available.", false, true, func(ctx context.Context, _ *mcp.CallToolRequest, in SemanticActionInput) (*mcp.CallToolResult, contract.ActionResult, error) {
 		if in.ElementID == "" {
-			err := contract.Validation("ELEMENT_ID_REQUIRED", "perform_action requires an AT-SPI element_id", nil)
-			return nil, contract.ActionResult{Action: "perform_action", OK: false, Backend: "at-spi"}, err
+			err := contract.Validation("ELEMENT_ID_REQUIRED", "perform_action requires an accessibility element_id", nil)
+			return nil, contract.ActionResult{Action: "perform_action", OK: false, Backend: platform.Current().Labels().Accessibility}, err
 		}
 		err := a11y.PerformAction(ctx, in.ElementID, in.Action)
-		return nil, contract.ActionResult{Action: "perform_action", OK: err == nil, Backend: "at-spi"}, err
+		return nil, contract.ActionResult{Action: "perform_action", OK: err == nil, Backend: platform.Current().Labels().Accessibility}, err
 	})
 	add(s, "computer_actions", "Execute an ordered batch of desktop actions. Requires schema_version=\""+contract.SchemaVersion+"\" at the top level.", false, true, func(ctx context.Context, _ *mcp.CallToolRequest, in pipeline.ActionBatch) (*mcp.CallToolResult, pipeline.BatchResult, error) {
 		out, err := pipeline.Run(ctx, in)
@@ -269,11 +269,11 @@ func New(opts Options) *mcp.Server {
 		res, err := pipeline.RunClickImage(ctx, in.toAction())
 		return nil, res, err
 	})
-	add(s, "window_move", "Move a window to (x, y) screen coordinates via EWMH _NET_MOVERESIZE_WINDOW. On tiling WMs the request may be refused; the result then carries a WINDOW_GEOMETRY_REFUSED warning under details.warning. Immediate-mode toolkits (Gio, ImGui, Flutter-Linux, egui) may report success but leave the rendered surface stale; in that case details.warning.code is WINDOW_GEOMETRY_DIVERGED with a rendered_bounds_estimate — fall back to find_color/find_text.", false, true, func(ctx context.Context, _ *mcp.CallToolRequest, in window.MoveRequest) (*mcp.CallToolResult, contract.ActionResult, error) {
+	add(s, "window_move", "Move a window to (x, y) screen coordinates via the platform window manager. On tiling WMs the request may be refused; the result then carries a WINDOW_GEOMETRY_REFUSED warning under details.warning. Immediate-mode toolkits (Gio, ImGui, Flutter-Linux, egui) may report success but leave the rendered surface stale; in that case details.warning.code is WINDOW_GEOMETRY_DIVERGED with a rendered_bounds_estimate — fall back to find_color/find_text.", false, true, func(ctx context.Context, _ *mcp.CallToolRequest, in window.MoveRequest) (*mcp.CallToolResult, contract.ActionResult, error) {
 		res, err := window.Move(ctx, in)
 		return nil, windowMCPResult("window_move", res, err), err
 	})
-	add(s, "window_resize", "Resize a window to width x height via EWMH _NET_MOVERESIZE_WINDOW. May be refused by tiling WMs (WINDOW_GEOMETRY_REFUSED) or accepted by the WM while the rendered surface stays stale on immediate-mode toolkits (WINDOW_GEOMETRY_DIVERGED with rendered_bounds_estimate). Check details.warning.", false, true, func(ctx context.Context, _ *mcp.CallToolRequest, in window.ResizeRequest) (*mcp.CallToolResult, contract.ActionResult, error) {
+	add(s, "window_resize", "Resize a window to width x height via the platform window manager. May be refused by tiling WMs (WINDOW_GEOMETRY_REFUSED) or accepted by the WM while the rendered surface stays stale on immediate-mode toolkits (WINDOW_GEOMETRY_DIVERGED with rendered_bounds_estimate). Check details.warning.", false, true, func(ctx context.Context, _ *mcp.CallToolRequest, in window.ResizeRequest) (*mcp.CallToolResult, contract.ActionResult, error) {
 		res, err := window.Resize(ctx, in)
 		return nil, windowMCPResult("window_resize", res, err), err
 	})
@@ -296,7 +296,7 @@ func New(opts Options) *mcp.Server {
 	add(s, "window_close", "Request that a window close via _NET_CLOSE_WINDOW. REQUIRES the server to be started with --allow-close; otherwise returns PRECONDITION_CLOSE_NOT_ALLOWED.", false, true, func(ctx context.Context, _ *mcp.CallToolRequest, in window.Target) (*mcp.CallToolResult, contract.ActionResult, error) {
 		if !opts.Config.AllowClose {
 			err := contract.Precondition("PRECONDITION_CLOSE_NOT_ALLOWED", "window_close requires the server to be started with --allow-close", map[string]any{"target": in})
-			return nil, contract.ActionResult{Action: "window_close", OK: false, Backend: "x11.EWMH"}, err
+			return nil, contract.ActionResult{Action: "window_close", OK: false, Backend: platform.Current().Labels().Window}, err
 		}
 		res, err := window.Close(ctx, in)
 		return nil, windowMCPResult("window_close", res, err), err
@@ -341,13 +341,13 @@ type ObserveInput struct {
 }
 
 type TextInput struct {
-	ElementID string `json:"element_id,omitempty" jsonschema:"AT-SPI element id returned by observe"`
+	ElementID string `json:"element_id,omitempty" jsonschema:"accessibility element id returned by observe"`
 	Text      string `json:"text" jsonschema:"literal text to type or set"`
 }
 
 type TypeTextInput struct {
 	Text string `json:"text" jsonschema:"literal text to type"`
-	Via  string `json:"via,omitempty" jsonschema:"routing: xtest, paste, or auto (default auto)"`
+	Via  string `json:"via,omitempty" jsonschema:"routing: direct keyboard injection, paste, or auto (default auto); xtest remains accepted on X11"`
 }
 
 type ClipboardReadInput struct {
@@ -371,7 +371,7 @@ type KeyInput struct {
 }
 
 type SemanticActionInput struct {
-	ElementID string `json:"element_id" jsonschema:"AT-SPI element id returned by observe"`
+	ElementID string `json:"element_id" jsonschema:"accessibility element id returned by observe"`
 	Action    string `json:"action,omitempty" jsonschema:"semantic accessibility action name; empty uses the first exposed action"`
 }
 
@@ -464,7 +464,7 @@ type BrowserSessionInput struct {
 // transport layer also surfaces err.
 func windowMCPResult(action string, res window.VerbResult, err error) contract.ActionResult {
 	if err != nil {
-		return contract.ActionResult{Action: action, OK: false, Backend: "x11.EWMH"}
+		return contract.ActionResult{Action: action, OK: false, Backend: platform.Current().Labels().Window}
 	}
 	details := map[string]any{"window": res.Window}
 	if res.Warning != nil {
@@ -473,7 +473,7 @@ func windowMCPResult(action string, res window.VerbResult, err error) contract.A
 	if len(res.Notes) > 0 {
 		details["notes"] = res.Notes
 	}
-	return contract.ActionResult{Action: action, OK: true, Backend: "x11.EWMH", Details: details}
+	return contract.ActionResult{Action: action, OK: true, Backend: platform.Current().Labels().Window, Details: details}
 }
 
 func add[In, Out any](s *mcp.Server, name, description string, readOnly bool, destructive bool, handler mcp.ToolHandlerFor[In, Out]) {

@@ -23,6 +23,7 @@ import (
 	"github.com/1broseidon/mc/internal/contract"
 	"github.com/1broseidon/mc/internal/input"
 	"github.com/1broseidon/mc/internal/pipeline"
+	"github.com/1broseidon/mc/internal/platform"
 )
 
 // clipboardOwnerEnv is the environment-variable handshake that switches
@@ -43,7 +44,7 @@ func newClipboardReadCommand() *cobra.Command {
 	var selection, mime string
 	cmd := &cobra.Command{
 		Use:   "clipboard-read",
-		Short: "Read the current value of an X11 selection (clipboard or primary)",
+		Short: "Read the current value of a clipboard selection (clipboard or primary)",
 		Example: `  mycomputer clipboard-read --json
   mycomputer clipboard-read --selection primary --json`,
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -67,11 +68,11 @@ func newClipboardWriteCommand() *cobra.Command {
 	var selection, mime, content string
 	cmd := &cobra.Command{
 		Use:   "clipboard-write",
-		Short: "Write content to an X11 selection; spawns a detached owner daemon so the selection persists past command exit",
-		Long: `clipboard-write takes ownership of the given X11 selection (CLIPBOARD by
+		Short: "Write content to a clipboard selection; spawns a detached owner daemon so the selection persists past command exit",
+		Long: `clipboard-write takes ownership of the given selection (CLIPBOARD by
 default; PRIMARY or both also supported) and detaches a small owner
 daemon so the selection survives the CLI exit. The daemon exits as
-soon as another X11 client takes ownership of the same selection (e.g.
+soon as another client takes ownership of the same selection (e.g.
 when the user copies something else), or when it receives SIGTERM.
 
 Content is treated as private local data — it is NEVER echoed to logs
@@ -493,7 +494,7 @@ func newPasteCommand() *cobra.Command {
 			if err := input.PressKey(cmd.Context(), chord); err != nil {
 				return err
 			}
-			out := contract.ActionResult{Action: "paste", OK: true, Backend: "XTest", Details: map[string]any{"method": method, "chord": chord}}
+			out := contract.ActionResult{Action: "paste", OK: true, Backend: platform.Current().Labels().Input, Details: map[string]any{"method": method, "chord": chord}}
 			if rootOpts.JSON {
 				return writeJSON(cmd.OutOrStdout(), out)
 			}

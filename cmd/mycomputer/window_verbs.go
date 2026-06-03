@@ -12,7 +12,7 @@ import (
 // addTargetFlags adds the standard --id/--title/--class/--pid set to a
 // cobra command and binds them to the given target pointer.
 func addTargetFlags(cmd *cobra.Command, t *window.Target) {
-	cmd.Flags().StringVar(&t.ID, "id", "", "target X11 window id, hex or decimal")
+	cmd.Flags().StringVar(&t.ID, "id", "", "target window id")
 	cmd.Flags().StringVar(&t.Title, "title", "", "target substring in window title")
 	cmd.Flags().StringVar(&t.Class, "class", "", "target WM_CLASS")
 	cmd.Flags().Uint32Var(&t.PID, "pid", 0, "target process id")
@@ -23,7 +23,7 @@ func newWindowMoveCommand() *cobra.Command {
 	var x, y int
 	cmd := &cobra.Command{
 		Use:   "window-move",
-		Short: "Move a window to (x, y) screen coordinates via EWMH _NET_MOVERESIZE_WINDOW",
+		Short: "Move a window to (x, y) screen coordinates via the platform window manager",
 		Example: `  mycomputer window-move --class fam-ui --x 100 --y 200
   mycomputer window-move --title Firefox --x 0 --y 0 --json`,
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -45,7 +45,7 @@ func newWindowResizeCommand() *cobra.Command {
 	var width, height int
 	cmd := &cobra.Command{
 		Use:   "window-resize",
-		Short: "Resize a window to width x height via EWMH _NET_MOVERESIZE_WINDOW",
+		Short: "Resize a window to width x height via the platform window manager",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			res, err := window.Resize(cmd.Context(), window.ResizeRequest{Target: target, Width: width, Height: height})
 			if err != nil {

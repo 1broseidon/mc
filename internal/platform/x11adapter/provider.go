@@ -40,6 +40,17 @@ type Provider struct{}
 func New() *Provider { return &Provider{} }
 
 func (*Provider) Name() string { return "x11" }
+func (*Provider) Labels() platform.BackendLabels {
+	return platform.BackendLabels{
+		Platform:      "x11",
+		Screen:        "x11",
+		Capture:       "x11.GetImage",
+		Window:        "x11.EWMH",
+		Input:         "XTest",
+		Clipboard:     "x11.clipboard",
+		Accessibility: "at-spi",
+	}
+}
 
 func (*Provider) Pointer() platform.Pointer       { return pointer{} }
 func (*Provider) Keyboard() platform.Keyboard     { return keyboard{} }

@@ -13,6 +13,7 @@
 #                        go install honnef.co/go/tools/cmd/staticcheck@latest
 #                        go install golang.org/x/tools/cmd/deadcode@latest
 #   conventions-check  validate cmd surface vs conventions.yaml (anvil)
+#   platform-boundary validate platform adapter import boundaries
 #   clean              remove ./bin
 #
 # Version injection:
@@ -59,7 +60,7 @@ RELEASE_LDFLAGS := -s -w $(LDFLAGS)
 
 # --- Targets ---------------------------------------------------------------
 
-.PHONY: build release install test lint conventions-check clean
+.PHONY: build release install test lint conventions-check platform-boundary clean
 
 build:
 	@mkdir -p $(BIN_DIR)
@@ -116,6 +117,9 @@ conventions-check:
 	else \
 		echo "anvil not found on PATH; skipping conventions-check"; \
 	fi
+
+platform-boundary:
+	./scripts/check-platform-boundary.sh
 
 clean:
 	rm -rf $(BIN_DIR)

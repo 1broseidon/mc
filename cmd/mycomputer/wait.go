@@ -45,7 +45,7 @@ func newWaitForWindowCommand() *cobra.Command {
 			return nil
 		},
 	}
-	cmd.Flags().StringVar(&target.ID, "id", "", "target X11 window id, hex or decimal")
+	cmd.Flags().StringVar(&target.ID, "id", "", "target window id")
 	cmd.Flags().StringVar(&target.Title, "title", "", "target substring in window title")
 	cmd.Flags().StringVar(&target.Class, "class", "", "target WM_CLASS")
 	cmd.Flags().Uint32Var(&target.PID, "pid", 0, "target process id")

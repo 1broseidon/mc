@@ -7,6 +7,20 @@ import (
 	"github.com/1broseidon/mc/internal/contract"
 )
 
+// BackendLabels contains user-facing backend labels for action results and
+// observe summaries. Portable service layers use these instead of spelling
+// protocol-specific backend names themselves; adapters keep legacy labels
+// stable for their platform.
+type BackendLabels struct {
+	Platform      string
+	Screen        string
+	Capture       string
+	Window        string
+	Input         string
+	Clipboard     string
+	Accessibility string
+}
+
 // Button identifies a pointer button in OS-neutral terms. Adapters map
 // these onto native button codes (X11 button numbers 1/2/3, Quartz
 // kCGMouseButton* constants, …).
