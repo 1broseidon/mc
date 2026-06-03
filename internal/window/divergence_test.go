@@ -80,37 +80,10 @@ func TestFormatRGB(t *testing.T) {
 	}
 }
 
-// TestClampToScreen mirrors the screen-package clamp logic; mostly a
-// guard to catch off-by-one changes in the divergence sampler.
-func TestClampToScreen(t *testing.T) {
-	screen := contract.Bounds{X: 0, Y: 0, Width: 1920, Height: 1080}
-	cases := []struct {
-		name string
-		in   contract.Bounds
-		want contract.Bounds
-	}{
-		{"inside", contract.Bounds{X: 100, Y: 100, Width: 50, Height: 50}, contract.Bounds{X: 100, Y: 100, Width: 50, Height: 50}},
-		{"left-edge", contract.Bounds{X: -20, Y: 100, Width: 50, Height: 50}, contract.Bounds{X: 0, Y: 100, Width: 30, Height: 50}},
-		{"top-edge", contract.Bounds{X: 100, Y: -10, Width: 50, Height: 50}, contract.Bounds{X: 100, Y: 0, Width: 50, Height: 40}},
-		{"right-edge", contract.Bounds{X: 1900, Y: 100, Width: 50, Height: 50}, contract.Bounds{X: 1900, Y: 100, Width: 20, Height: 50}},
-		{"bottom-edge", contract.Bounds{X: 100, Y: 1050, Width: 50, Height: 50}, contract.Bounds{X: 100, Y: 1050, Width: 50, Height: 30}},
-		{"fully out", contract.Bounds{X: 5000, Y: 5000, Width: 50, Height: 50}, contract.Bounds{X: 5000, Y: 5000, Width: 0, Height: 0}},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			got := clampToScreen(tc.in, screen)
-			// Negative widths (fully out case) are not normalized — the
-			// "empty" semantics is captured by Bounds.Empty(), not by
-			// nullifying x/y. Compare the empty bit, not the exact rect.
-			if got.Empty() && tc.want.Empty() {
-				return
-			}
-			if got != tc.want {
-				t.Fatalf("clampToScreen(%+v) = %+v, want %+v", tc.in, got, tc.want)
-			}
-		})
-	}
-}
+// NOTE: TestClampToScreen was removed when region clamping moved into the
+// platform screen backend (the divergence sampler now grabs through
+// platform.Screen().Grab, which clamps). The clamp behavior is covered by
+// the x11adapter screen tests.
 
 // TestCombinedChannelVariance pins the texture-gate calibration. A
 // flat solid color (the v0.3.2 false-positive trap) must sit at or

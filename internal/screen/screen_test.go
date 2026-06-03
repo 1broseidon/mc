@@ -97,42 +97,10 @@ func TestInfoMonitors(t *testing.T) {
 	}
 }
 
-// TestComputeScaleNegative pins the contract that scale never falls
-// below 1.0 when inputs are unavailable or invalid (zero-width
-// monitors, missing millimeter dimensions). A non-positive scale
-// would break point-translation math elsewhere.
-func TestComputeScaleNegative(t *testing.T) {
-	cases := []struct {
-		name    string
-		widthPx int
-		widthMm uint32
-	}{
-		{name: "zero pixels", widthPx: 0, widthMm: 100},
-		{name: "negative pixels", widthPx: -1, widthMm: 100},
-		{name: "zero millimeters", widthPx: 1920, widthMm: 0},
-	}
-	for _, tc := range cases {
-		got := computeScale(tc.widthPx, tc.widthMm)
-		if got != 1.0 {
-			t.Fatalf("computeScale(%s) = %v; want fallback 1.0", tc.name, got)
-		}
-	}
-}
-
-// TestComputeScalePositive verifies the DPI math against the
-// canonical 96 DPI baseline: a 1920px monitor measuring 508mm wide
-// (~20.0 inches) yields ~96 DPI → scale ≈ 1.0; halving the inch
-// measurement doubles the DPI → scale ≈ 2.0.
-func TestComputeScalePositive(t *testing.T) {
-	standard := computeScale(1920, 508)
-	if standard < 0.9 || standard > 1.1 {
-		t.Fatalf("expected scale near 1.0 for 1920px / 508mm, got %v", standard)
-	}
-	hidpi := computeScale(1920, 254)
-	if hidpi < 1.9 || hidpi > 2.1 {
-		t.Fatalf("expected scale near 2.0 for 1920px / 254mm, got %v", hidpi)
-	}
-}
+// NOTE: TestComputeScaleNegative / TestComputeScalePositive moved to
+// internal/platform/x11adapter when the RandR scale derivation migrated
+// into the platform backend. TestInfoMonitors above still exercises the
+// monitor contract through the public Info() seam.
 
 // TestLogicalCoordsToggle verifies the package-level toggle round-
 // trips. Default is false; set true; reset to false. The screen and

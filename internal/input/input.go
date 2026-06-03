@@ -1,19 +1,20 @@
 package input
 
+// Anvil · target: internal/input · kind: package · scope: package
+// caller profile: agent,script · surface pattern: package-API (delegating) · risk class: R0
+// contracts: Move/Click/Drag/Scroll/PressKey/TypeText/TypeTextWith + error codes preserved
+// obligations: XTest injection + XKB keymap delegated to platform.Provider
+
 import (
 	"context"
 	"strings"
 	"time"
-	"unicode"
-
-	"github.com/jezek/xgb/xproto"
-	"github.com/jezek/xgb/xtest"
 
 	"github.com/1broseidon/mc/internal/clipboard"
 	"github.com/1broseidon/mc/internal/contract"
+	"github.com/1broseidon/mc/internal/platform"
 	"github.com/1broseidon/mc/internal/screen"
 	"github.com/1broseidon/mc/internal/window"
-	"github.com/1broseidon/mc/internal/x11"
 )
 
 // TypeTextVia enumerates the routing modes for TypeText.
@@ -104,25 +105,36 @@ func ResolveContextFor(ctx context.Context, points ...contract.Point) (contract.
 	return rctx, nil
 }
 
-func Move(ctx context.Context, point contract.Point) error {
-	// All coordinate-space translation routes through contract.Resolve.
+// resolveScreenPoint converts a Point in any coordinate space into an
+// absolute, logical-coords-adjusted screen coordinate, then validates it
+// against the screen bounds. POINT_OUT_OF_BOUNDS is owned here (not in the
+// adapter) so the contract is identical across platforms.
+func resolveScreenPoint(ctx context.Context, point contract.Point) (int, int, error) {
 	rctx, err := ResolveContextFor(ctx, point)
 	if err != nil {
-		return err
+		return 0, 0, err
 	}
 	x, y, err := contract.Resolve(point, rctx)
 	if err != nil {
-		return err
+		return 0, 0, err
 	}
 	x, y = applyLogicalCoords(ctx, x, y)
-	return withDisplay(ctx, func(d *x11.Display) error {
-		if !x11.ScreenBounds(d).Contains(x, y) {
-			return contract.Validation("POINT_OUT_OF_BOUNDS", "screen coordinate is outside the screen", map[string]any{"x": x, "y": y, "screen": x11.ScreenBounds(d)})
-		}
-		xtest.FakeInput(d.Conn, xproto.MotionNotify, 0, xproto.TimeCurrentTime, d.Screen.Root, int16(x), int16(y), 0)
-		d.Conn.Sync()
-		return nil
-	})
+	bounds, err := platform.Current().Screen().ScreenBounds(ctx)
+	if err != nil {
+		return 0, 0, err
+	}
+	if !bounds.Contains(x, y) {
+		return 0, 0, contract.Validation("POINT_OUT_OF_BOUNDS", "screen coordinate is outside the screen", map[string]any{"x": x, "y": y, "screen": bounds})
+	}
+	return x, y, nil
+}
+
+func Move(ctx context.Context, point contract.Point) error {
+	x, y, err := resolveScreenPoint(ctx, point)
+	if err != nil {
+		return err
+	}
+	return platform.Current().Pointer().MoveTo(ctx, x, y)
 }
 
 // applyLogicalCoords translates a resolved physical-space coordinate
@@ -147,7 +159,7 @@ func applyLogicalCoords(ctx context.Context, x, y int) (int, int) {
 }
 
 func Click(ctx context.Context, req ClickRequest) error {
-	button, err := buttonNumber(req.Button)
+	button, err := buttonFor(req.Button)
 	if err != nil {
 		return err
 	}
@@ -158,18 +170,20 @@ func Click(ctx context.Context, req ClickRequest) error {
 	if err := Move(ctx, req.Point); err != nil {
 		return err
 	}
-	return withDisplay(ctx, func(d *x11.Display) error {
-		for i := 0; i < count; i++ {
-			xtest.FakeInput(d.Conn, xproto.ButtonPress, button, xproto.TimeCurrentTime, d.Screen.Root, 0, 0, 0)
-			xtest.FakeInput(d.Conn, xproto.ButtonRelease, button, xproto.TimeCurrentTime, d.Screen.Root, 0, 0, 0)
+	p := platform.Current().Pointer()
+	for i := 0; i < count; i++ {
+		if err := p.Button(ctx, button, platform.Press); err != nil {
+			return err
 		}
-		d.Conn.Sync()
-		return nil
-	})
+		if err := p.Button(ctx, button, platform.Release); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func Drag(ctx context.Context, req DragRequest) error {
-	button, err := buttonNumber(req.Button)
+	button, err := buttonFor(req.Button)
 	if err != nil {
 		return err
 	}
@@ -187,60 +201,62 @@ func Drag(ctx context.Context, req DragRequest) error {
 	}
 	fromX, fromY = applyLogicalCoords(ctx, fromX, fromY)
 	toX, toY = applyLogicalCoords(ctx, toX, toY)
+	// Validate BOTH endpoints before pressing so we never strand the
+	// button down with a mid-drag POINT_OUT_OF_BOUNDS. Interior points
+	// lie on the segment between two in-bounds endpoints, so they need
+	// no per-step re-validation.
+	bounds, err := platform.Current().Screen().ScreenBounds(ctx)
+	if err != nil {
+		return err
+	}
+	if !bounds.Contains(fromX, fromY) || !bounds.Contains(toX, toY) {
+		return contract.Validation("POINT_OUT_OF_BOUNDS", "drag coordinates must be inside the screen", map[string]any{"from": req.From, "to": req.To, "screen": bounds})
+	}
 	duration := time.Duration(req.DurationMS) * time.Millisecond
 	if duration <= 0 {
 		duration = 250 * time.Millisecond
 	}
-	return withDisplay(ctx, func(d *x11.Display) error {
-		bounds := x11.ScreenBounds(d)
-		if !bounds.Contains(fromX, fromY) || !bounds.Contains(toX, toY) {
-			return contract.Validation("POINT_OUT_OF_BOUNDS", "drag coordinates must be inside the screen", map[string]any{"from": req.From, "to": req.To, "screen": bounds})
+	p := platform.Current().Pointer()
+	if err := p.MoveTo(ctx, fromX, fromY); err != nil {
+		return err
+	}
+	if err := p.Button(ctx, button, platform.Press); err != nil {
+		return err
+	}
+	steps := 12
+	for i := 1; i <= steps; i++ {
+		x := fromX + (toX-fromX)*i/steps
+		y := fromY + (toY-fromY)*i/steps
+		if err := p.MoveTo(ctx, x, y); err != nil {
+			return err
 		}
-		steps := 12
-		xtest.FakeInput(d.Conn, xproto.MotionNotify, 0, xproto.TimeCurrentTime, d.Screen.Root, int16(fromX), int16(fromY), 0)
-		xtest.FakeInput(d.Conn, xproto.ButtonPress, button, xproto.TimeCurrentTime, d.Screen.Root, int16(fromX), int16(fromY), 0)
-		for i := 1; i <= steps; i++ {
-			x := fromX + (toX-fromX)*i/steps
-			y := fromY + (toY-fromY)*i/steps
-			xtest.FakeInput(d.Conn, xproto.MotionNotify, 0, xproto.TimeCurrentTime, d.Screen.Root, int16(x), int16(y), 0)
-			d.Conn.Sync()
-			time.Sleep(duration / time.Duration(steps))
-		}
-		xtest.FakeInput(d.Conn, xproto.ButtonRelease, button, xproto.TimeCurrentTime, d.Screen.Root, int16(toX), int16(toY), 0)
-		d.Conn.Sync()
-		return nil
-	})
+		time.Sleep(duration / time.Duration(steps))
+	}
+	return p.Button(ctx, button, platform.Release)
 }
 
 func Scroll(ctx context.Context, req ScrollRequest) error {
-	button := byte(5)
-	switch strings.ToLower(req.Direction) {
-	case "up":
-		button = 4
-	case "down", "":
-		button = 5
-	case "left":
-		button = 6
-	case "right":
-		button = 7
-	default:
-		return contract.Validation("INVALID_SCROLL_DIRECTION", "scroll direction must be up, down, left, or right", map[string]any{"direction": req.Direction})
-	}
 	amount := req.Amount
 	if amount <= 0 {
 		amount = 3
 	}
+	var dx, dy int
+	switch strings.ToLower(req.Direction) {
+	case "up":
+		dy = -amount
+	case "down", "":
+		dy = amount
+	case "left":
+		dx = -amount
+	case "right":
+		dx = amount
+	default:
+		return contract.Validation("INVALID_SCROLL_DIRECTION", "scroll direction must be up, down, left, or right", map[string]any{"direction": req.Direction})
+	}
 	if err := Move(ctx, req.Point); err != nil {
 		return err
 	}
-	return withDisplay(ctx, func(d *x11.Display) error {
-		for i := 0; i < amount; i++ {
-			xtest.FakeInput(d.Conn, xproto.ButtonPress, button, xproto.TimeCurrentTime, d.Screen.Root, 0, 0, 0)
-			xtest.FakeInput(d.Conn, xproto.ButtonRelease, button, xproto.TimeCurrentTime, d.Screen.Root, 0, 0, 0)
-		}
-		d.Conn.Sync()
-		return nil
-	})
+	return platform.Current().Pointer().Scroll(ctx, dx, dy)
 }
 
 func PressKey(ctx context.Context, chord string) error {
@@ -248,54 +264,7 @@ func PressKey(ctx context.Context, chord string) error {
 	if err != nil {
 		return err
 	}
-	return withDisplay(ctx, func(d *x11.Display) error {
-		mapper, err := newKeyMapper(d)
-		if err != nil {
-			return err
-		}
-		var codes []keyPress
-		for _, key := range keys {
-			ks := keysymForName(key)
-			press, err := mapper.lookup(ks)
-			if err != nil {
-				// For single printable characters, surface the same
-				// INPUT_LAYOUT_UNREACHABLE error the type_text xtest
-				// path uses — the chord layer is the public seam for
-				// both presses and types of a single rune.
-				if runes := []rune(key); len(runes) == 1 && ks != 0 {
-					return contract.Validation("INPUT_LAYOUT_UNREACHABLE", "character is not reachable from the active XKB layout", map[string]any{
-						"rune":      key,
-						"codepoint": uint32(runes[0]),
-						"recommend": "via:paste (type_text)",
-					})
-				}
-				return err
-			}
-			codes = append(codes, press)
-		}
-		for _, press := range codes {
-			if press.shift {
-				shift, err := mapper.lookup(xkShiftL)
-				if err != nil {
-					return err
-				}
-				xtest.FakeInput(d.Conn, xproto.KeyPress, byte(shift.code), xproto.TimeCurrentTime, d.Screen.Root, 0, 0, 0)
-			}
-			xtest.FakeInput(d.Conn, xproto.KeyPress, byte(press.code), xproto.TimeCurrentTime, d.Screen.Root, 0, 0, 0)
-		}
-		for i := len(codes) - 1; i >= 0; i-- {
-			xtest.FakeInput(d.Conn, xproto.KeyRelease, byte(codes[i].code), xproto.TimeCurrentTime, d.Screen.Root, 0, 0, 0)
-			if codes[i].shift {
-				shift, err := mapper.lookup(xkShiftL)
-				if err != nil {
-					return err
-				}
-				xtest.FakeInput(d.Conn, xproto.KeyRelease, byte(shift.code), xproto.TimeCurrentTime, d.Screen.Root, 0, 0, 0)
-			}
-		}
-		d.Conn.Sync()
-		return nil
-	})
+	return platform.Current().Keyboard().KeyCombo(ctx, keys)
 }
 
 // TypeText is the legacy entry point. It defaults to auto routing and
@@ -349,7 +318,7 @@ func TypeTextWith(ctx context.Context, req TypeTextRequest) (TypeTextResult, err
 		result.ClipboardRestored = restored
 		return result, nil
 	case TypeTextViaXTest:
-		if err := typeTextViaXTest(ctx, req.Text); err != nil {
+		if err := platform.Current().Keyboard().TypeText(ctx, req.Text); err != nil {
 			return result, err
 		}
 		return result, nil
@@ -415,60 +384,6 @@ func autoTypeTextRoute(text string, imeActive bool) string {
 	return route
 }
 
-// typeTextViaXTest is the layout-aware XTest path. It refuses to type
-// characters that the active XKB keymap cannot produce (returning
-// INPUT_LAYOUT_UNREACHABLE) instead of silently emitting wrong chars.
-func typeTextViaXTest(ctx context.Context, text string) error {
-	return withDisplay(ctx, func(d *x11.Display) error {
-		mapper, err := newKeyMapper(d)
-		if err != nil {
-			return err
-		}
-		shift, _ := mapper.lookup(xkShiftL)
-		// First pass: validate every rune is reachable from the current
-		// keymap. We never partially type; either the full string maps
-		// or we surface INPUT_LAYOUT_UNREACHABLE with the offending rune.
-		for i, r := range text {
-			ks := keysymForRune(r)
-			if ks == 0 {
-				return contract.Validation("INPUT_LAYOUT_UNREACHABLE", "character is not reachable from the active XKB layout", map[string]any{
-					"index":     i,
-					"rune":      string(r),
-					"codepoint": uint32(r),
-					"recommend": "via:paste",
-				})
-			}
-			if _, err := mapper.lookup(ks); err != nil {
-				return contract.Validation("INPUT_LAYOUT_UNREACHABLE", "character is not reachable from the active XKB layout", map[string]any{
-					"index":     i,
-					"rune":      string(r),
-					"codepoint": uint32(r),
-					"recommend": "via:paste",
-				})
-			}
-		}
-		for _, r := range text {
-			ks := keysymForRune(r)
-			press, err := mapper.lookup(ks)
-			if err != nil {
-				return contract.Validation("INPUT_LAYOUT_UNREACHABLE", "character is not reachable from the active XKB layout", map[string]any{
-					"rune": string(r), "codepoint": uint32(r), "recommend": "via:paste",
-				})
-			}
-			if press.shift {
-				xtest.FakeInput(d.Conn, xproto.KeyPress, byte(shift.code), xproto.TimeCurrentTime, d.Screen.Root, 0, 0, 0)
-			}
-			xtest.FakeInput(d.Conn, xproto.KeyPress, byte(press.code), xproto.TimeCurrentTime, d.Screen.Root, 0, 0, 0)
-			xtest.FakeInput(d.Conn, xproto.KeyRelease, byte(press.code), xproto.TimeCurrentTime, d.Screen.Root, 0, 0, 0)
-			if press.shift {
-				xtest.FakeInput(d.Conn, xproto.KeyRelease, byte(shift.code), xproto.TimeCurrentTime, d.Screen.Root, 0, 0, 0)
-			}
-		}
-		d.Conn.Sync()
-		return nil
-	})
-}
-
 // typeTextViaPaste saves the current CLIPBOARD value, writes text,
 // sends ctrl+v, then restores the previous clipboard content (best
 // effort). The returned bool reports whether the restore actually fired.
@@ -497,172 +412,29 @@ func typeTextViaPaste(ctx context.Context, text string) (bool, error) {
 	return restored, nil
 }
 
-func withDisplay(ctx context.Context, fn func(*x11.Display) error) error {
-	if err := ctx.Err(); err != nil {
-		return contract.Cancelled("input operation cancelled")
-	}
-	d, err := x11.Open()
-	if err != nil {
-		return err
-	}
-	defer d.Close()
-	if err := xtest.Init(d.Conn); err != nil {
-		return contract.Dependency("XTEST_UNAVAILABLE", "XTest extension is not available", map[string]any{"error": err.Error()})
-	}
-	return fn(d)
-}
-
-func buttonNumber(name string) (byte, error) {
+func buttonFor(name string) (platform.Button, error) {
 	switch strings.ToLower(name) {
 	case "", "left":
-		return 1, nil
+		return platform.ButtonLeft, nil
 	case "middle":
-		return 2, nil
+		return platform.ButtonMiddle, nil
 	case "right":
-		return 3, nil
+		return platform.ButtonRight, nil
 	default:
 		return 0, contract.Validation("INVALID_BUTTON", "button must be left, middle, or right", map[string]any{"button": name})
 	}
 }
 
-func parseChord(chord string) ([]string, error) {
-	var keys []string
+func parseChord(chord string) ([]platform.Key, error) {
+	var keys []platform.Key
 	for _, part := range strings.Split(chord, "+") {
 		part = strings.TrimSpace(strings.ToLower(part))
 		if part != "" {
-			keys = append(keys, part)
+			keys = append(keys, platform.Key(part))
 		}
 	}
 	if len(keys) == 0 {
 		return nil, contract.Validation("INVALID_KEY", "key chord is empty", nil)
 	}
 	return keys, nil
-}
-
-type keyPress struct {
-	code  xproto.Keycode
-	shift bool
-}
-
-type keyMapper struct {
-	min     xproto.Keycode
-	perCode int
-	keysyms []xproto.Keysym
-}
-
-func newKeyMapper(d *x11.Display) (*keyMapper, error) {
-	minCode := d.Setup.MinKeycode
-	maxCode := d.Setup.MaxKeycode
-	count := byte(maxCode - minCode + 1)
-	reply, err := xproto.GetKeyboardMapping(d.Conn, minCode, count).Reply()
-	if err != nil {
-		return nil, contract.Dependency("KEYMAP_UNAVAILABLE", "failed to query X11 keyboard mapping", map[string]any{"error": err.Error()})
-	}
-	return &keyMapper{min: minCode, perCode: int(reply.KeysymsPerKeycode), keysyms: reply.Keysyms}, nil
-}
-
-func (m *keyMapper) lookup(ks xproto.Keysym) (keyPress, error) {
-	if ks == 0 {
-		return keyPress{}, contract.Validation("INVALID_KEY", "key is not supported by the MVP key mapper", nil)
-	}
-	for i, value := range m.keysyms {
-		if value != ks {
-			continue
-		}
-		keyIndex := i / m.perCode
-		column := i % m.perCode
-		return keyPress{code: m.min + xproto.Keycode(keyIndex), shift: column%2 == 1}, nil
-	}
-	return keyPress{}, contract.Validation("KEY_UNMAPPED", "key is not available in current X11 keymap", map[string]any{"keysym": uint32(ks)})
-}
-
-const (
-	xkBackspace = xproto.Keysym(0xff08)
-	xkTab       = xproto.Keysym(0xff09)
-	xkReturn    = xproto.Keysym(0xff0d)
-	xkEscape    = xproto.Keysym(0xff1b)
-	xkDelete    = xproto.Keysym(0xffff)
-	xkHome      = xproto.Keysym(0xff50)
-	xkLeft      = xproto.Keysym(0xff51)
-	xkUp        = xproto.Keysym(0xff52)
-	xkRight     = xproto.Keysym(0xff53)
-	xkDown      = xproto.Keysym(0xff54)
-	xkPageUp    = xproto.Keysym(0xff55)
-	xkPageDown  = xproto.Keysym(0xff56)
-	xkEnd       = xproto.Keysym(0xff57)
-	xkShiftL    = xproto.Keysym(0xffe1)
-	xkControlL  = xproto.Keysym(0xffe3)
-	xkAltL      = xproto.Keysym(0xffe9)
-	xkSuperL    = xproto.Keysym(0xffeb)
-)
-
-func keysymForName(name string) xproto.Keysym {
-	switch strings.ToLower(name) {
-	case "enter", "return":
-		return xkReturn
-	case "tab":
-		return xkTab
-	case "esc", "escape":
-		return xkEscape
-	case "backspace":
-		return xkBackspace
-	case "delete", "del":
-		return xkDelete
-	case "home":
-		return xkHome
-	case "end":
-		return xkEnd
-	case "pageup", "page_up":
-		return xkPageUp
-	case "pagedown", "page_down":
-		return xkPageDown
-	case "up", "arrowup":
-		return xkUp
-	case "down", "arrowdown":
-		return xkDown
-	case "left", "arrowleft":
-		return xkLeft
-	case "right", "arrowright":
-		return xkRight
-	case "ctrl", "control":
-		return xkControlL
-	case "alt", "option":
-		return xkAltL
-	case "shift":
-		return xkShiftL
-	case "cmd", "command", "meta", "super":
-		return xkSuperL
-	}
-	if strings.HasPrefix(strings.ToLower(name), "f") && len(name) <= 3 {
-		n := 0
-		for _, r := range name[1:] {
-			if r < '0' || r > '9' {
-				return xproto.Keysym(0)
-			}
-			n = n*10 + int(r-'0')
-		}
-		if n >= 1 && n <= 35 {
-			return xproto.Keysym(0xffbd + n)
-		}
-	}
-	if len([]rune(name)) == 1 {
-		return keysymForRune([]rune(name)[0])
-	}
-	return xproto.Keysym(0)
-}
-
-func keysymForRune(r rune) xproto.Keysym {
-	switch r {
-	case '\n':
-		return xkReturn
-	case '\t':
-		return xkTab
-	}
-	if r >= 0x20 && r <= 0x7e {
-		return xproto.Keysym(r)
-	}
-	if unicode.IsPrint(r) {
-		return xproto.Keysym(r)
-	}
-	return xproto.Keysym(0)
 }

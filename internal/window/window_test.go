@@ -8,45 +8,9 @@ import (
 	"github.com/1broseidon/mc/internal/contract"
 )
 
-// TestClientBoundsCalculation exercises the pure decoration-inset math
-// without touching X11. Verifies that the client_bounds rectangle
-// correctly subtracts WM frame extents and that zero-inset windows
-// fall back to the outer bounds.
-func TestClientBoundsCalculation(t *testing.T) {
-	cases := []struct {
-		name   string
-		outer  contract.Bounds
-		insets contract.DecorationInsets
-		want   contract.Bounds
-	}{
-		{
-			name:   "no insets falls back to outer",
-			outer:  contract.Bounds{X: 100, Y: 200, Width: 800, Height: 600},
-			insets: contract.DecorationInsets{},
-			want:   contract.Bounds{X: 100, Y: 200, Width: 800, Height: 600},
-		},
-		{
-			name:   "standard decoration subtracts borders",
-			outer:  contract.Bounds{X: 100, Y: 200, Width: 800, Height: 600},
-			insets: contract.DecorationInsets{Left: 1, Top: 25, Right: 1, Bottom: 1},
-			want:   contract.Bounds{X: 101, Y: 225, Width: 798, Height: 574},
-		},
-		{
-			name:   "oversized insets fall back to outer",
-			outer:  contract.Bounds{X: 0, Y: 0, Width: 100, Height: 100},
-			insets: contract.DecorationInsets{Left: 200, Top: 200, Right: 200, Bottom: 200},
-			want:   contract.Bounds{X: 0, Y: 0, Width: 100, Height: 100},
-		},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			got := clientBounds(tc.outer, tc.insets)
-			if got != tc.want {
-				t.Fatalf("clientBounds(%+v, %+v) = %+v, want %+v", tc.outer, tc.insets, got, tc.want)
-			}
-		})
-	}
-}
+// NOTE: TestClientBoundsCalculation moved to internal/platform/x11adapter
+// when the decoration-inset math (clientBounds) migrated into the window
+// backend alongside the EWMH property readers.
 
 // TestGeometryMismatch verifies that the post-op divergence detector
 // honors the 5-pixel tolerance and only flags axes that were actually
