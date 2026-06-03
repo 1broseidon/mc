@@ -19,8 +19,8 @@
 //	keyboard   — DONE (XTest + XKB keymap)
 //	clipboard  — DONE (selection-owner protocol)
 //	windows    — DONE (EWMH/ICCCM list + control)
-//	a11y       — pending (Accessibility reports unavailable)
-//	activity   — pending (Activity reports unavailable)
+//	a11y       — DONE (AT-SPI over D-Bus)
+//	activity   — DONE (XInput2 xinput watcher)
 package x11adapter
 
 import (
@@ -47,15 +47,27 @@ func (*Provider) Screen() platform.ScreenGrabber  { return screenGrabber{} }
 func (*Provider) Windows() platform.WindowManager { return windowManager{} }
 func (*Provider) Clipboard() platform.Clipboard   { return clipboard{} }
 
-// Accessibility (AT-SPI) is not yet migrated into the adapter; report it as
-// unavailable so callers degrade gracefully rather than erroring per-call.
-func (*Provider) Accessibility() (platform.Accessibility, bool) { return nil, false }
+// Accessibility exposes AT-SPI through the platform seam.
+func (*Provider) Accessibility() (platform.Accessibility, bool) { return x11Accessibility{}, true }
 
-// Activity (XInput2 yield watcher) is not yet migrated; report unavailable.
-func (*Provider) Activity() (platform.UserActivityWatcher, bool) { return nil, false }
+// Activity exposes the XInput2 yield watcher through the platform seam.
+func (*Provider) Activity() (platform.UserActivityWatcher, bool) { return xinputActivity{}, true }
 
 // Probe reports the X11 backend readiness rows. Delegates to the existing
 // internal/x11 probe, which covers DISPLAY/XAUTHORITY/x11/xtest/randr/xfixes.
 func (*Provider) Probe(ctx context.Context) []contract.BackendStatus {
 	return x11.Probe()
+}
+
+// MaybeAutoDetectDisplay implements platform.DisplayAutoDetector over the
+// existing X11 socket probe. It is intentionally X11-only: platforms without
+// DISPLAY semantics simply do not implement DisplayAutoDetector.
+func (*Provider) MaybeAutoDetectDisplay() platform.DisplayAutoDetectResult {
+	res := x11.MaybeAutoDetectDisplay()
+	return platform.DisplayAutoDetectResult{
+		Display:   res.Display,
+		Source:    res.Source,
+		Ambiguous: res.Ambiguous,
+		Empty:     res.Empty,
+	}
 }

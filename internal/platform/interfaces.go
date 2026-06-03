@@ -3,6 +3,7 @@ package platform
 import (
 	"context"
 	"image"
+	"time"
 
 	"github.com/1broseidon/mc/internal/contract"
 )
@@ -133,6 +134,24 @@ type ClipboardDaemon interface {
 	Done() (<-chan struct{}, error)
 }
 
+// DisplayAutoDetector is an OPTIONAL capability for backends that can
+// repair a missing display environment from a local desktop session. X11
+// uses it to detect a single live /tmp/.X11-unix socket when MCP hosts are
+// launched from a non-X-aware shell. Platforms without DISPLAY semantics do
+// not implement it.
+type DisplayAutoDetector interface {
+	MaybeAutoDetectDisplay() DisplayAutoDetectResult
+}
+
+// InputMethodProbe is an OPTIONAL capability for keyboard/input backends
+// that can detect the current Input Method Editor state. The input service
+// uses it to decide whether type_text via:xtest should be blocked and
+// whether via:auto should route through paste.
+type InputMethodProbe interface {
+	DetectIME(ctx context.Context) IMEStatus
+	ProbeIME(ctx context.Context) contract.BackendStatus
+}
+
 // Accessibility exposes the platform accessibility tree and its actions.
 // Optional — see Provider.Accessibility. The service layer owns the
 // breadth-first traversal policy, window-id correlation, and per-bus
@@ -159,6 +178,8 @@ type UserActivityWatcher interface {
 	// Start begins watching and returns a channel of human-input events
 	// plus a stop function. The channel closes when watching ends.
 	Start(ctx context.Context) (events <-chan ActivityEvent, stop func(), err error)
+	// Sample starts a short watcher run and counts user events. Used by doctor.
+	Sample(ctx context.Context, d time.Duration) (count int, err error)
 }
 
 // Provider is the per-OS aggregate of every capability. Exactly one

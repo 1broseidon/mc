@@ -15,10 +15,10 @@ import (
 	"github.com/1broseidon/mc/internal/contract"
 	imageutil "github.com/1broseidon/mc/internal/image"
 	"github.com/1broseidon/mc/internal/input"
+	"github.com/1broseidon/mc/internal/platform"
 	"github.com/1broseidon/mc/internal/screen"
 	"github.com/1broseidon/mc/internal/wait"
 	"github.com/1broseidon/mc/internal/window"
-	"github.com/1broseidon/mc/internal/yield"
 )
 
 // dryRunTypeTextRoute computes the (via, reason) the live type_text
@@ -364,25 +364,29 @@ func Run(ctx context.Context, batch ActionBatch) (BatchResult, error) {
 		return out, nil
 	}
 
-	// Yield setup: when RespectUser is on AND xinput is available we
-	// start a Watcher and inspect its events between actions.
+	// Activity setup: when RespectUser is on AND the platform exposes a
+	// user-activity watcher we start it and inspect events between actions.
 	// Server/headless callers (no TTY) pass RespectUser=false so the
 	// watcher is never spawned. The watcher is best-effort: a failed
 	// Start logs to stderr and continues without yield.
-	var yieldCh <-chan yield.Event
-	var watcher *yield.Watcher
+	var yieldCh <-chan platform.ActivityEvent
 	if batch.RespectUser {
-		if ok, _ := yield.Available(); ok {
-			watcher = &yield.Watcher{Buffer: 64}
-			if err := watcher.Start(ctx); err != nil {
-				fmt.Fprintf(os.Stderr, "mycomputer: yield watcher start failed: %v\n", err)
-				watcher = nil
+		if watcher, ok := platform.Current().Activity(); ok {
+			if available, _ := watcher.Available(); available {
+				events, stop, err := watcher.Start(ctx)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "mycomputer: yield watcher start failed: %v\n", err)
+				} else {
+					yieldCh = events
+					if stop != nil {
+						defer stop()
+					}
+				}
 			} else {
-				yieldCh = watcher.Events()
-				defer watcher.Stop()
+				fmt.Fprintln(os.Stderr, "mycomputer: --respect-user requested but activity watcher not available; yield disabled")
 			}
 		} else {
-			fmt.Fprintln(os.Stderr, "mycomputer: --respect-user requested but xinput not available; yield disabled")
+			fmt.Fprintln(os.Stderr, "mycomputer: --respect-user requested but activity watcher not available; yield disabled")
 		}
 	}
 	quietMS := batch.QuietMS
@@ -478,9 +482,9 @@ func Run(ctx context.Context, batch ActionBatch) (BatchResult, error) {
 // The function returns immediately (nil) when no event is pending —
 // the common case. yieldCh must be drained between calls so we don't
 // over-trigger on stale events.
-func waitForQuiet(ctx context.Context, yieldCh <-chan yield.Event, out *BatchResult, quiet, timeout time.Duration) error {
+func waitForQuiet(ctx context.Context, yieldCh <-chan platform.ActivityEvent, out *BatchResult, quiet, timeout time.Duration) error {
 	// Non-blocking peek: if no event pending, return immediately.
-	var first *yield.Event
+	var first *platform.ActivityEvent
 	select {
 	case e, ok := <-yieldCh:
 		if !ok {
@@ -524,8 +528,8 @@ func waitForQuiet(ctx context.Context, yieldCh <-chan yield.Event, out *BatchRes
 	}
 }
 
-func recordYield(out *BatchResult, e yield.Event) {
-	ev := YieldEvent{TS: e.TS, DeviceID: e.Master, SourceID: e.Slave, EventType: string(e.Kind)}
+func recordYield(out *BatchResult, e platform.ActivityEvent) {
+	ev := YieldEvent{TS: e.TS, DeviceID: e.DeviceID, SourceID: e.SourceID, EventType: e.Kind}
 	out.YieldEvents = append(out.YieldEvents, ev)
 	writeAudit(audit.Record{
 		BatchID:     out.BatchID,
@@ -533,9 +537,9 @@ func recordYield(out *BatchResult, e yield.Event) {
 		Type:        "yield.observed",
 		OK:          true,
 		YieldEvent: &audit.YieldSummary{
-			DeviceID:  e.Master,
-			SourceID:  e.Slave,
-			EventType: string(e.Kind),
+			DeviceID:  e.DeviceID,
+			SourceID:  e.SourceID,
+			EventType: e.Kind,
 		},
 	})
 }

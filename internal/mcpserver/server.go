@@ -15,10 +15,10 @@ import (
 	"github.com/1broseidon/mc/internal/diagnostic"
 	"github.com/1broseidon/mc/internal/input"
 	"github.com/1broseidon/mc/internal/pipeline"
+	"github.com/1broseidon/mc/internal/platform"
 	"github.com/1broseidon/mc/internal/screen"
 	"github.com/1broseidon/mc/internal/wait"
 	"github.com/1broseidon/mc/internal/window"
-	"github.com/1broseidon/mc/internal/x11"
 )
 
 type Options struct {
@@ -83,10 +83,13 @@ func GetServerInfo(version contract.VersionInfo) ServerInfo {
 
 func New(opts Options) *mcp.Server {
 	// MCP hosts are often launched from shells or desktop entries that
-	// do not inherit DISPLAY. Initialize it once at server construction
-	// when a single live X socket is discoverable; unresolved cases stay
-	// unset so individual tools can return structured AppErrors.
-	x11.MaybeAutoDetectDisplay()
+	// do not inherit platform display state. Initialize it once at server
+	// construction when the active backend can auto-detect a display;
+	// unresolved cases stay unset so individual tools can return structured
+	// AppErrors.
+	if detector, ok := platform.Current().(platform.DisplayAutoDetector); ok {
+		detector.MaybeAutoDetectDisplay()
+	}
 	instructions := "MyComputer drives an X11 desktop for agents. computer_actions payloads require schema_version=\"" +
 		contract.SchemaVersion + "\". Supported schema_versions: " +
 		strings.Join(contract.SupportedSchemaVersions(), ", ") + "."

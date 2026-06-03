@@ -37,11 +37,11 @@ func TestProviderImplementsInterface(t *testing.T) {
 		p.Windows() == nil || p.Clipboard() == nil {
 		t.Fatal("provider returned a nil capability")
 	}
-	if _, ok := p.Accessibility(); ok {
-		t.Fatal("accessibility should report unavailable until migrated")
+	if _, ok := p.Accessibility(); !ok {
+		t.Fatal("accessibility should be available on the X11 adapter")
 	}
-	if _, ok := p.Activity(); ok {
-		t.Fatal("activity should report unavailable until migrated")
+	if _, ok := p.Activity(); !ok {
+		t.Fatal("activity should be available on the X11 adapter")
 	}
 }
 

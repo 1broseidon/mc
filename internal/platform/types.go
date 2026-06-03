@@ -2,6 +2,7 @@ package platform
 
 import (
 	"image"
+	"time"
 
 	"github.com/1broseidon/mc/internal/contract"
 )
@@ -130,6 +131,9 @@ type Node struct {
 	// platform exposes them; empty string otherwise (never a placeholder).
 	App     string
 	Toolkit string
+	// PID is optional native process metadata used by the portable a11y
+	// service for window correlation. Zero means unknown.
+	PID uint32
 }
 
 // ActivityEvent is a single observed human input event reported by a
@@ -138,6 +142,30 @@ type Node struct {
 // user (not MyComputer's own synthetic input) is driving the desktop so a
 // --respect-user batch can pause.
 type ActivityEvent struct {
-	// Kind is one of "motion", "button", or "key".
+	// Kind is a backend event token (X11 uses RawMotion,
+	// RawButtonPress, RawKeyPress).
 	Kind string
+	// Optional native metadata used only for result/audit reporting.
+	DeviceID int
+	SourceID int
+	Detail   int
+	TS       time.Time
+}
+
+// IMEStatus describes the current state of any Input Method Editor.
+// It is read-only; callers must never try to disable an active IME.
+type IMEStatus struct {
+	Active       bool   `json:"active"`
+	Engine       string `json:"engine,omitempty"`
+	InputContext string `json:"input_context,omitempty"`
+}
+
+// DisplayAutoDetectResult describes a backend's attempt to infer a missing
+// display environment. X11 fills these from /tmp/.X11-unix; other platforms
+// generally leave the optional capability unimplemented.
+type DisplayAutoDetectResult struct {
+	Display   string
+	Source    string
+	Ambiguous []string
+	Empty     bool
 }

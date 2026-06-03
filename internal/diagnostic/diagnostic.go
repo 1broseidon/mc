@@ -7,16 +7,14 @@ import (
 	"strings"
 	"time"
 
-	"github.com/1broseidon/mc/internal/a11y"
 	"github.com/1broseidon/mc/internal/audit"
 	"github.com/1broseidon/mc/internal/browser"
 	"github.com/1broseidon/mc/internal/clipboard"
 	"github.com/1broseidon/mc/internal/config"
 	"github.com/1broseidon/mc/internal/contract"
 	imageutil "github.com/1broseidon/mc/internal/image"
+	"github.com/1broseidon/mc/internal/platform"
 	"github.com/1broseidon/mc/internal/window"
-	"github.com/1broseidon/mc/internal/x11"
-	"github.com/1broseidon/mc/internal/yield"
 )
 
 // ewmhAtomToCapability maps _NET_SUPPORTED atom names onto the short
@@ -44,13 +42,13 @@ var ewmhAtomToCapability = []struct {
 // inject the catalog to keep AvailableTools drift-free.
 func Doctor(version contract.VersionInfo, cfg config.Effective, tools []string) contract.DoctorReport {
 	version.Go = runtime.Version()
-	autoDisplay := x11.MaybeAutoDetectDisplay()
-	backends := x11.Probe()
+	now := time.Now().UTC()
+	autoDisplay := maybeAutoDetectDisplay()
+	backends := platform.Current().Probe(context.Background())
 	annotateDisplayAutoDetect(backends, autoDisplay)
 	annotateEWMHCapabilities(backends)
-	backends = append(backends, a11y.Probe())
+	backends = append(backends, probeAccessibility(now))
 	backends = append(backends, browser.Probe(cfg.BrowserBin, cfg.BrowserEndpoint))
-	now := time.Now().UTC()
 	tess := imageutil.ProbeOCRTesseract()
 	tess.CheckedAt = now
 	backends = append(backends, tess)
@@ -68,7 +66,7 @@ func Doctor(version contract.VersionInfo, cfg config.Effective, tools []string) 
 	// task-6: xinput2 row. Reports whether the xinput binary that
 	// drives MC's yield watcher is available, plus whether a brief
 	// 200ms sample actually saw any real user events (sees_user_events).
-	backends = append(backends, probeXInput2(now))
+	backends = append(backends, probeActivity(now))
 
 	// task-6: audit row. Reports the audit directory, whether it's
 	// writable, retention setting, and today's byte count.
@@ -124,25 +122,35 @@ func Doctor(version contract.VersionInfo, cfg config.Effective, tools []string) 
 	}
 }
 
-// probeXInput2 returns a BackendStatus describing the xinput2 yield
-// listener. ready=true when the xinput binary is found on PATH; we
-// additionally start a brief 200ms watcher and report how many real
-// (non-MC-synthetic) raw events arrived in that window. A zero count
-// is not a failure — the user was simply idle during the sample.
-func probeXInput2(now time.Time) contract.BackendStatus {
-	ok, path := yield.Available()
-	if !ok {
-		return contract.BackendStatus{
-			Name:      "xinput2",
-			Ready:     false,
-			Required:  false,
-			Message:   "xinput binary not found on PATH (required for --respect-user)",
-			CheckedAt: now,
-		}
+// maybeAutoDetectDisplay asks the active platform to repair a missing
+// display environment when it supports that concept (X11). Non-DISPLAY
+// platforms return an empty result.
+func maybeAutoDetectDisplay() platform.DisplayAutoDetectResult {
+	if detector, ok := platform.Current().(platform.DisplayAutoDetector); ok {
+		return detector.MaybeAutoDetectDisplay()
 	}
-	count, err := yield.SampleUserEvents(context.Background(), 200*time.Millisecond)
+	return platform.DisplayAutoDetectResult{}
+}
+
+func probeAccessibility(now time.Time) contract.BackendStatus {
+	if _, ok := platform.Current().Accessibility(); !ok {
+		return contract.BackendStatus{Name: "at_spi", Ready: false, Required: false, Message: "accessibility backend unavailable on this platform", CheckedAt: now}
+	}
+	return contract.BackendStatus{Name: "at_spi", Ready: true, Required: false, Message: "available", Capabilities: []string{"tree", "action", "set_text"}, CheckedAt: now}
+}
+
+func probeActivity(now time.Time) contract.BackendStatus {
+	watcher, ok := platform.Current().Activity()
+	if !ok {
+		return contract.BackendStatus{Name: "xinput2", Ready: false, Required: false, Message: "activity watcher unavailable on this platform", CheckedAt: now}
+	}
+	available, detail := watcher.Available()
+	if !available {
+		return contract.BackendStatus{Name: "xinput2", Ready: false, Required: false, Message: "activity watcher not available (required for --respect-user)", Details: map[string]any{"detail": detail}, CheckedAt: now}
+	}
+	count, err := watcher.Sample(context.Background(), 200*time.Millisecond)
 	details := map[string]any{
-		"path":               path,
+		"path":               detail,
 		"sees_user_events":   count > 0,
 		"sampled_events":     count,
 		"sample_duration_ms": 200,
@@ -152,15 +160,7 @@ func probeXInput2(now time.Time) contract.BackendStatus {
 		msg = "available (sample failed: " + err.Error() + ")"
 		details["sample_error"] = err.Error()
 	}
-	return contract.BackendStatus{
-		Name:         "xinput2",
-		Ready:        true,
-		Required:     false,
-		Message:      msg,
-		Details:      details,
-		Capabilities: []string{"raw_motion", "raw_button_press", "raw_key_press"},
-		CheckedAt:    now,
-	}
+	return contract.BackendStatus{Name: "xinput2", Ready: true, Required: false, Message: msg, Details: details, Capabilities: []string{"raw_motion", "raw_button_press", "raw_key_press"}, CheckedAt: now}
 }
 
 // probeAudit returns a BackendStatus describing the audit-log writer.
@@ -203,7 +203,7 @@ func probeAudit(now time.Time) contract.BackendStatus {
 //   - no live sockets: row keeps its default "not set" message.
 //
 // When DISPLAY was already set the row is untouched.
-func annotateDisplayAutoDetect(backends []contract.BackendStatus, res x11.AutoDetectResult) {
+func annotateDisplayAutoDetect(backends []contract.BackendStatus, res platform.DisplayAutoDetectResult) {
 	if res.Display == "" && len(res.Ambiguous) == 0 {
 		return
 	}
@@ -234,7 +234,7 @@ func annotateDisplayAutoDetect(backends []contract.BackendStatus, res x11.AutoDe
 
 // displayRemediationHint returns the next-action string for the
 // DISPLAY-unset blocked state, tailored to what the auto-probe found.
-func displayRemediationHint(res x11.AutoDetectResult) string {
+func displayRemediationHint(res platform.DisplayAutoDetectResult) string {
 	switch {
 	case len(res.Ambiguous) > 0:
 		return "DISPLAY is unset and /tmp/.X11-unix/ has multiple live sockets (" + strings.Join(res.Ambiguous, ", ") + "); pick one via 'mycomputer serve --display <value>' or export DISPLAY before launching the MCP host"
