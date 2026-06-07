@@ -246,6 +246,7 @@ The skill source ships under [`skill/`](skill/) in this repo:
 | Document | Purpose |
 | --- | --- |
 | [`docs/mycomputer-mvp-spec.md`](docs/mycomputer-mvp-spec.md) | Full MVP specification: verbs, schemas, readiness rules |
+| [`docs/platform-adapters.md`](docs/platform-adapters.md) | Platform seam + checklist for adding a backend (e.g. macOS) |
 | [`conventions.yaml`](conventions.yaml) | Wire contract: error codes, envelopes, flag conventions |
 | [`anvil.md`](anvil.md) | Locked public surface for the v0.3.x release line |
 | [`docs/CHANGELOG.md`](docs/CHANGELOG.md) | Keep-a-Changelog ledger; wire-affecting changes land here |
